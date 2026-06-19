@@ -20,12 +20,11 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     git \
     curl \
     wget
-RUN add-apt-repository ppa:ubuntu-toolchain-r/test && \
-    apt update && \
-    apt install -y --no-install-recommends \
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends \
     gcc-11 \
     g++-11 \
-    gcc-11 g++-11 patchelf && \
+    patchelf && \
     rm -rf /var/lib/apt/lists/*
 
 # Set GCC-11 and G++-11 as the default

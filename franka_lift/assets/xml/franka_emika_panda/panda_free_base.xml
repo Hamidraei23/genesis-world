@@ -18,19 +18,19 @@
       <default class="collision">
         <geom type="mesh" group="3"/>
         <default class="fingertip_pad_collision_1">
-          <geom type="box" size="0.0085 0.004 0.0085" pos="0 0.0055 0.0445" friction="0.5 0.005 0.0001"/>
+          <geom type="box" size="0.0085 0.004 0.0085" pos="0 0.0055 0.0445"/>
         </default>
         <default class="fingertip_pad_collision_2">
-          <geom type="box" size="0.003 0.002 0.003" pos="0.0055 0.002 0.05" friction="0.5 0.005 0.0001"/>
+          <geom type="box" size="0.003 0.002 0.003" pos="0.0055 0.002 0.05"/>
         </default>
         <default class="fingertip_pad_collision_3">
-          <geom type="box" size="0.003 0.002 0.003" pos="-0.0055 0.002 0.05" friction="0.5 0.005 0.0001"/>
+          <geom type="box" size="0.003 0.002 0.003" pos="-0.0055 0.002 0.05"/>
         </default>
         <default class="fingertip_pad_collision_4">
-          <geom type="box" size="0.003 0.002 0.0035" pos="0.0055 0.002 0.0395" friction="0.5 0.005 0.0001"/>
+          <geom type="box" size="0.003 0.002 0.0035" pos="0.0055 0.002 0.0395"/>
         </default>
         <default class="fingertip_pad_collision_5">
-          <geom type="box" size="0.003 0.002 0.0035" pos="-0.0055 0.002 0.0395" friction="0.75 0.005 0.0001"/>
+          <geom type="box" size="0.003 0.002 0.0035" pos="-0.0055 0.002 0.0395"/>
         </default>
       </default>
     </default>
@@ -118,6 +118,7 @@
   <worldbody>
     <light name="top" pos="0 0 2" mode="trackcom"/>
     <body name="link0" childclass="panda">
+      <joint armature="0" damping="0" limited="false" margin="0.01" name="root" pos="0 0 0" type="free"/>
       <inertial mass="0.629769" pos="-0.041018 -0.00014 0.049974"
         fullinertia="0.00315 0.00388 0.004285 8.2904e-7 0.00015 8.2299e-6"/>
       <geom mesh="link0_0" material="off_white" class="visual"/>
@@ -278,6 +279,6 @@
   </actuator>
 
   <keyframe>
-    <key name="home" qpos="0 0 0 -1.57079 0 1.57079 -0.7853 0.04 0.04" ctrl="0 0 0 -1.57079 0 1.57079 -0.7853 255"/>
+    <key name="home" qpos="0 0 0 1 0 0 0 0 0 0 -1.57079 0 1.57079 -0.7853 0.04 0.04" ctrl="0 0 0 -1.57079 0 1.57079 -0.7853 255"/>
   </keyframe>
 </mujoco>

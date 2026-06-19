@@ -18,19 +18,19 @@
       <default class="collision">
         <geom type="mesh" group="3"/>
         <default class="fingertip_pad_collision_1">
-          <geom type="box" size="0.0085 0.004 0.0085" pos="0 0.0055 0.0445" friction="0.5 0.005 0.0001"/>
+          <geom type="box" size="0.0085 0.004 0.0085" pos="0 0.0055 0.0445"/>
         </default>
         <default class="fingertip_pad_collision_2">
-          <geom type="box" size="0.003 0.002 0.003" pos="0.0055 0.002 0.05" friction="0.5 0.005 0.0001"/>
+          <geom type="box" size="0.003 0.002 0.003" pos="0.0055 0.002 0.05"/>
         </default>
         <default class="fingertip_pad_collision_3">
-          <geom type="box" size="0.003 0.002 0.003" pos="-0.0055 0.002 0.05" friction="0.5 0.005 0.0001"/>
+          <geom type="box" size="0.003 0.002 0.003" pos="-0.0055 0.002 0.05"/>
         </default>
         <default class="fingertip_pad_collision_4">
-          <geom type="box" size="0.003 0.002 0.0035" pos="0.0055 0.002 0.0395" friction="0.5 0.005 0.0001"/>
+          <geom type="box" size="0.003 0.002 0.0035" pos="0.0055 0.002 0.0395"/>
         </default>
         <default class="fingertip_pad_collision_5">
-          <geom type="box" size="0.003 0.002 0.0035" pos="-0.0055 0.002 0.0395" friction="0.75 0.005 0.0001"/>
+          <geom type="box" size="0.003 0.002 0.0035" pos="-0.0055 0.002 0.0395"/>
         </default>
       </default>
     </default>
@@ -42,6 +42,7 @@
     <material class="panda" name="black" rgba="0.25 0.25 0.25 1"/>
     <material class="panda" name="green" rgba="0 1 0 1"/>
     <material class="panda" name="light_blue" rgba="0.039216 0.541176 0.780392 1"/>
+    <material name="grasped_cuboid_blue" rgba="0.18 0.42 0.82 1"/>
 
     <!-- Collision meshes -->
     <mesh name="link0_c" file="link0.stl"/>
@@ -239,6 +240,13 @@
                         <geom class="fingertip_pad_collision_4"/>
                         <geom class="fingertip_pad_collision_5"/>
                       </body>
+                      <body name="grasped_cuboid" pos="0 0 0.1029" quat="0.00187891 -0.71790805 -0.00193768 -0.69613270">
+                        <inertial mass="0.005" pos="0 0 0" diaginertia="9.6354e-5 9.6354e-5 5.2083e-6"/>
+                        <geom name="grasped_cuboid_visual" type="box" size="0.0125 0.0125 0.075"
+                          material="grasped_cuboid_blue" contype="0" conaffinity="0" group="2"/>
+                        <geom name="grasped_cuboid_collision" type="box" size="0.0125 0.0125 0.075"
+                          friction="1.2 0.005 0.0001" condim="4" group="3"/>
+                      </body>
                     </body>
                   </body>
                 </body>
@@ -278,6 +286,6 @@
   </actuator>
 
   <keyframe>
-    <key name="home" qpos="0 0 0 -1.57079 0 1.57079 -0.7853 0.04 0.04" ctrl="0 0 0 -1.57079 0 1.57079 -0.7853 255"/>
+    <key name="home" qpos="0 -0.82 0 -2.18 0 2.9 0.78 0.000251 0.000251" ctrl="0 -0.82 0 -2.18 0 2.9 0.78 70.125"/>
   </keyframe>
 </mujoco>

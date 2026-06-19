@@ -104,11 +104,11 @@ def main():
                 np.array([1.0, 0, 0, 0, 0, 0, 0, 0, 0])[:1],
                 motors_dof_idx[:1],
             )
-        elif i == 1000:
-            franka.control_dofs_force(
-                np.array([0, 0, 0, 0, 0, 0, 0, 0, 0]),
-                motors_dof_idx,
-            )
+        # elif i == 1000:
+        #     franka.control_dofs_force(
+        #         np.array([0, 0, 0, 0, 0, 0, 0, 0, 0]),
+        #         motors_dof_idx,
+        #     )
         # This is the internal control force computed based on the given control command
         # If using force control, it's the same as the given control command
         print("control force:", franka.get_dofs_control_force(motors_dof_idx))
