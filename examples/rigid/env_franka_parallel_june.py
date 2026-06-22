@@ -65,17 +65,18 @@ class FrankaEnvParallel:
     """
     Vectorised Franka environment.
 
-    Observations: flat tensor (N, OBS_DIM=10)
+    Observations: flat tensor (N, OBS_DIM=15)
         [0]    ee_pos_z
         [1]    ee_vel_z
-        [2]    target_z_vel
-        [3]    target_z_acc
-        [4]    left_force_mag   (scalar)
-        [5]    right_force_mag  (scalar)
-        [6]    cuboid_rel_z
-        [7]    cuboid_rel_x
-        [8]    cuboid_rel_y
-        [9]    desired_rel_z
+        [2]    fingertip_distance
+        [3]    target_z_vel
+        [4]    target_z_acc
+        [5:8]  left_force  (3,)
+        [8:11] right_force (3,)
+        [11]   cuboid_rel_z
+        [12]   cuboid_rel_x
+        [13]   cuboid_rel_y
+        [14]   desired_rel_z
 
     Actions (per env, shape (N, action_dim=3)):
         [0]   target_z_vel
@@ -83,23 +84,18 @@ class FrankaEnvParallel:
     """
 
     # Observation layout constants
-    OBS_DIM            = 10
+    OBS_DIM            = 15
     OBS_EE_POS_Z       = 0
     OBS_EE_VEL_Z       = 1
-    OBS_TARGET_Z_VEL   = 2
-    OBS_TARGET_Z_ACC   = 3
-    OBS_LEFT_FORCE_MAG = 4
-    OBS_RIGHT_FORCE_MAG = 5
-    OBS_CUBOID_REL_Z   = 6
-    OBS_CUBOID_REL_X   = 7
-    OBS_CUBOID_REL_Y   = 8
-    OBS_DESIRED_REL_Z  = 9
-
-    # Fixed observation normalization scales (divide raw obs by these)
-    # Order: ee_pos_z, ee_vel_z, target_z_vel, target_z_acc,
-    #        left_force_mag, right_force_mag,
-    #        cuboid_rel_z, cuboid_rel_x, cuboid_rel_y, desired_rel_z
-    OBS_SCALE = [1.0, 0.6, 0.6, 15.0, 5.0, 5.0, 0.05, 0.05, 0.05, 0.05]
+    OBS_FINGERTIP_DIST = 2
+    OBS_TARGET_Z_VEL   = 3
+    OBS_TARGET_Z_ACC   = 4
+    OBS_LEFT_FORCE     = slice(5, 8)
+    OBS_RIGHT_FORCE    = slice(8, 11)
+    OBS_CUBOID_REL_Z   = 11
+    OBS_CUBOID_REL_X   = 12
+    OBS_CUBOID_REL_Y   = 13
+    OBS_DESIRED_REL_Z  = 14
 
     # Action scaling constants
     Z_VEL_MAX       = 0.6
@@ -139,8 +135,6 @@ class FrankaEnvParallel:
         limit_regrasp: bool = False,
         solid_up: bool = False,
         mix: bool = False,
-        randomize: bool = False,
-        normalize: bool = False,
     ):
         self.num_envs = num_envs
         self.device = gs.device
@@ -153,8 +147,6 @@ class FrankaEnvParallel:
         self.limit_regrasp = limit_regrasp
         self.solid_up = solid_up
         self.mix = mix
-        self.randomize = randomize
-        self.normalize = normalize
         self.extras: dict = {}
         self.cfg = {
             "num_envs": num_envs,
@@ -169,8 +161,6 @@ class FrankaEnvParallel:
             "limit_regrasp": limit_regrasp,
             "solid_up": solid_up,
             "mix": mix,
-            "randomize": randomize,
-            "normalize": normalize,
         }
 
         self.gripper_pos_min = torch.tensor([gripper_pos_min, gripper_pos_min], device=self.device)
@@ -385,15 +375,6 @@ class FrankaEnvParallel:
 
         self._randomize_friction(envs_idx)
 
-        # ---- initial velocity randomization (domain randomization) ----
-        if self.randomize:
-            _n = len(envs_idx)
-            # Add small random joint velocities to arm DOFs (±0.01 rad/s)
-            qvel_noise = (torch.rand(_n, 7, device=self.device) * 2.0 - 1.0) * 0.01
-            qvel = torch.zeros(_n, 9, device=self.device)
-            qvel[:, :7] = qvel_noise
-            self.franka.set_dofs_velocity(qvel, envs_idx=envs_idx)
-
         self.sim_step = 0
 
         self._update_obs_buf()
@@ -427,7 +408,7 @@ class FrankaEnvParallel:
         # Open region:   2 <= steps <= 6     → gripper_pos_max
         # Close step:    steps == 1          → gripper_pos_min
         # Done:          steps == 0          → policy
-        _pulse_start = 3 + self.PULSE_DELAY_STEPS
+        _pulse_start = 6 + self.PULSE_DELAY_STEPS
         _gp_mid = (self.gripper_pos_min + self.gripper_pos_max).mean() * 0.5  # scalar midpoint
         _gp_avg = gripper_pos.mean(dim=-1)                                     # (N,)
         _rising = (
@@ -497,15 +478,18 @@ class FrankaEnvParallel:
         cuboid_pos = self.cuboid.get_pos()  # (N, 3)
         left_ft = self._fingertip_pos(self.left_finger)    # (N, 3)
         right_ft = self._fingertip_pos(self.right_finger)  # (N, 3)
+        fingertip_dist = (left_ft - right_ft).norm(dim=-1)  # (N,)
 
         link_forces = self.franka.get_links_net_contact_force()  # (N, n_links, 3)
         left_force = link_forces[:, self.left_finger.idx_local, :]   # (N, 3)
         right_force = link_forces[:, self.right_finger.idx_local, :]  # (N, 3)
-        left_force_mag = left_force.norm(dim=-1, keepdim=True)    # (N, 1)
-        right_force_mag = right_force.norm(dim=-1, keepdim=True)  # (N, 1)
+        # print("Left force is {:.3f} N, Right force is {:.3f} N".format(left_force[0].item(), right_force[0].item()))
+        # env_id = 0
+        # print(f"Left force env {env_id}: {left_force[env_id].detach().cpu().numpy()}")
+        # print(f"Right force env {env_id}: {right_force[env_id].detach().cpu().numpy()}")
 
         finger_mid = (left_ft + right_ft) / 2.0  # (N, 3)
-        _noise_range = 0.003 if self.randomize else 0.0
+        _noise_range = 0.0  # uniform noise in [-0.002, +0.002]
         _N = self.num_envs
 
         def _unoise(shape):
@@ -514,20 +498,16 @@ class FrankaEnvParallel:
         self.obs_buf = torch.cat([
             ee_pos[:, 2:3]  + _unoise((_N, 1)),                                     # [0]    ee_pos_z
             ee_vel[:, 2:3]  + _unoise((_N, 1)),                                     # [1]    ee_vel_z
-            self.target_z_vel.unsqueeze(-1),                                         # [2]    target_z_vel
-            self.target_z_acc.unsqueeze(-1),                                         # [3]    target_z_acc
-            left_force_mag,                                                          # [4]    left_force_mag
-            right_force_mag,                                                         # [5]    right_force_mag
-            (cuboid_pos[:, 2] - finger_mid[:, 2]).unsqueeze(-1) + _unoise((_N, 1)), # [6]    cuboid_rel_z
-            (cuboid_pos[:, 0] - finger_mid[:, 0]).unsqueeze(-1) + _unoise((_N, 1)), # [7]    cuboid_rel_x
-            (cuboid_pos[:, 1] - finger_mid[:, 1]).unsqueeze(-1) + _unoise((_N, 1)), # [8]    cuboid_rel_y
-            self.desired_rel_z.unsqueeze(-1),                                        # [9]    desired_rel_z
-        ], dim=-1)  # (N, 10)
-
-        if self.normalize:
-            if not hasattr(self, '_obs_scale_t'):
-                self._obs_scale_t = torch.tensor(self.OBS_SCALE, device=self.device)
-            self.obs_buf = self.obs_buf / self._obs_scale_t
+            fingertip_dist.unsqueeze(-1),                                            # [2]    fingertip_distance
+            self.target_z_vel.unsqueeze(-1),                                         # [3]    target_z_vel
+            self.target_z_acc.unsqueeze(-1),                                         # [4]    target_z_acc
+            left_force,                                                              # [5:8]  left_force
+            right_force,                                                             # [8:11] right_force
+            (cuboid_pos[:, 2] - finger_mid[:, 2]).unsqueeze(-1) + _unoise((_N, 1)), # [11]   cuboid_rel_z
+            (cuboid_pos[:, 0] - finger_mid[:, 0]).unsqueeze(-1) + _unoise((_N, 1)), # [12]   cuboid_rel_x
+            (cuboid_pos[:, 1] - finger_mid[:, 1]).unsqueeze(-1) + _unoise((_N, 1)), # [13]   cuboid_rel_y
+            self.desired_rel_z.unsqueeze(-1),                                        # [14]   desired_rel_z
+        ], dim=-1)  # (N, 15)
 
     def get_observation(self) -> torch.Tensor:
         """Returns flat obs tensor (num_envs, OBS_DIM). Convenience for non-rsl_rl usage."""
@@ -708,14 +688,6 @@ class FrankaEnvParallel:
         self._prev_gripper_avg[envs_idx] = self.gripper_pos_min.mean()
         self._randomize_friction(envs_idx)
 
-        # ---- initial velocity randomization (domain randomization) ----
-        if self.randomize:
-            _n = len(envs_idx)
-            qvel_noise = (torch.rand(_n, 7, device=self.device) * 2.0 - 1.0) * 0.01
-            qvel = torch.zeros(_n, 9, device=self.device)
-            qvel[:, :7] = qvel_noise
-            self.franka.set_dofs_velocity(qvel, envs_idx=envs_idx)
-
     # ------------------------------------------------------------------ #
     # Internal: friction randomisation                                    #
     # ------------------------------------------------------------------ #
@@ -857,12 +829,6 @@ class FrankaEnvParallel:
         offset = self.fingertip_local.unsqueeze(0).expand(self.num_envs, -1)  # (N, 3)
         return pos + _tbq(offset, quat)
 
-    def get_fingertip_distance(self) -> torch.Tensor:
-        """Return per-env fingertip distance (N,)."""
-        left_ft = self._fingertip_pos(self.left_finger)
-        right_ft = self._fingertip_pos(self.right_finger)
-        return (left_ft - right_ft).norm(dim=-1)
-
     def _reset_cuboid_home_pose(self, envs_idx: torch.Tensor):
         from genesis.utils.geom import transform_by_quat as _tbq, transform_quat_by_quat as _tqbq
 
@@ -898,11 +864,11 @@ class FrankaEnvParallel:
         self.franka.set_dofs_kv(kv_motors, self.motors_dof)
         self.franka.set_dofs_force_range(f_lo, f_hi, self.motors_dof)
 
-        self.franka.set_dofs_kp(torch.tensor([500.0, 500.0], device=self.device), self.fingers_dof)
-        self.franka.set_dofs_kv(torch.tensor([25.0, 25.0], device=self.device), self.fingers_dof)
+        self.franka.set_dofs_kp(torch.tensor([100.0, 100.0], device=self.device), self.fingers_dof)
+        self.franka.set_dofs_kv(torch.tensor([10.0, 10.0], device=self.device), self.fingers_dof)
         self.franka.set_dofs_force_range(
-            torch.tensor([-500.0, -500.0], device=self.device),
-            torch.tensor([500.0, 500.0], device=self.device),
+            torch.tensor([-100.0, -100.0], device=self.device),
+            torch.tensor([100.0, 100.0], device=self.device),
             self.fingers_dof,
         )
 

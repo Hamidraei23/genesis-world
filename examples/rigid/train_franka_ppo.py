@@ -108,6 +108,10 @@ def main():
                         help="Mix normal and solid-up modes: randomly assign positive/negative desired_rel_z per env")
     parser.add_argument("--complex", action="store_true",
                         help="Use complex force/regrasp reward (default: simple EE height shaping reward)")
+    parser.add_argument("--randomize", action="store_true",
+                        help="Enable domain randomization: obs noise and initial joint velocity perturbation")
+    parser.add_argument("--normalization", action="store_true",
+                        help="Enable fixed observation normalization (scales each obs channel to ~[-1, 1])")
     args = parser.parse_args()
 
     log_dir = f"logs/{args.exp_name}"
@@ -138,6 +142,8 @@ def main():
         limit_regrasp=args.limit_regrasp,
         solid_up=args.negative,
         mix=args.mix,
+        randomize=args.randomize,
+        normalize=args.normalization,
     )
 
     runner = OnPolicyRunner(env, train_cfg, log_dir, device=gs.device)

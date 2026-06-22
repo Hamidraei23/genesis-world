@@ -16,8 +16,8 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 
 class FrankaEnv:
     # Keep in sync with FrankaEnvParallel
-    OBS_DIM            = 10
-    Z_VEL_MAX          = 0.6
+    OBS_DIM            = 15
+    Z_VEL_MAX          = 0.85
     Z_ACC_MAX          = 15.00   # m/s² — hard limit on target-velocity rate of change
     Z_ACC_PENALTY_THRESHOLD = 13.0
     Z_ACC_PENALTY_WEIGHT    = 30.0
@@ -31,9 +31,6 @@ class FrankaEnv:
     REGRASP_FORCE_THRESHOLD = 0.75  # N: avg finger force below this → released, above → grasped
     REGRASP_BONUS_PER_STEP  = 10.0  # reward per step spent in release before regrasp
 
-    # Fixed observation normalization scales (must match FrankaEnvParallel.OBS_SCALE)
-    OBS_SCALE = np.array([1.0, 0.6, 0.6, 15.0, 5.0, 5.0, 0.05, 0.05, 0.05, 0.05], dtype=np.float32)
-
     def __init__(
         self,
         *,
@@ -46,7 +43,6 @@ class FrankaEnv:
         gripper_pos_min=0.000251,
         gripper_pos_max=0.0124,
         solid_up: bool = False,
-        normalize: bool = False,
     ):
         if playback_speed <= 0.0:
             raise ValueError("playback_speed must be greater than 0")
@@ -62,7 +58,6 @@ class FrankaEnv:
         self.action_dim = 3
         self.z_vel_max = 0.7
         self.solid_up = solid_up
-        self.normalize = normalize
         self.gripper_pos_min = np.broadcast_to(np.asarray(gripper_pos_min, dtype=float), (2,)).copy()
         self.gripper_pos_max = np.broadcast_to(np.asarray(gripper_pos_max, dtype=float), (2,)).copy()
         self.closed_gripper_pos = np.array([-1.0, -1.0])
@@ -222,10 +217,10 @@ class FrankaEnv:
         return {
             "ee_pos": float(ee_pos[2]),
             "ee_vel": float(self.ee_link.get_vel().cpu().numpy()[2]),
+            "fingertip_distance": float(np.linalg.norm(left_ft - right_ft)),
             "target_z_vel": self.target_z_vel,
             "target_z_acc": self.target_z_acc,
-            "left_force_mag": float(np.linalg.norm(left_force)),
-            "right_force_mag": float(np.linalg.norm(right_force)),
+            "link_forces": np.stack([left_force, right_force]),
             "cuboid_rel_z": float(cuboid_pos[2] - finger_mid[2]),
             "cuboid_rel_x": float(cuboid_pos[0] - finger_mid[0]),
             "cuboid_rel_y": float(cuboid_pos[1] - finger_mid[1]),
@@ -257,22 +252,28 @@ class FrankaEnv:
         self.initial_tracking  = 20.0 * math.exp(-30.0 * self.initial_z_error)
 
     def get_obs_flat(self) -> np.ndarray:
-        """Returns flat (OBS_DIM=10,) float32 array in the same order as FrankaEnvParallel."""
+        """Returns flat (OBS_DIM=15,) float32 array in the same order as FrankaEnvParallel."""
+        left_force, right_force = self.get_finger_net_contact_forces()
+        ee_pos   = self.ee_link.get_pos().cpu().numpy().flatten()
+        ee_vel_z = float(self.ee_link.get_vel().cpu().numpy()[2])
+        cuboid_pos = self.cuboid.get_pos().cpu().numpy().flatten()
+        left_ft    = self.get_fingertip_pos(self.left_finger)
+        right_ft   = self.get_fingertip_pos(self.right_finger)
+        finger_mid = (left_ft + right_ft) / 2.0
         obs = self.get_observation()
         obs_flat = np.array([
             obs["ee_pos"],
             obs["ee_vel"],
+            obs["fingertip_distance"],
             obs["target_z_vel"],
             obs["target_z_acc"],
-            obs["left_force_mag"],
-            obs["right_force_mag"],
+            obs["link_forces"][0, 0], obs["link_forces"][0, 1], obs["link_forces"][0, 2],
+            obs["link_forces"][1, 0], obs["link_forces"][1, 1], obs["link_forces"][1, 2],
             obs["cuboid_rel_z"],
             obs["cuboid_rel_x"],
             obs["cuboid_rel_y"],
             obs["desired_rel_z"],
         ], dtype=np.float32)
-        if self.normalize:
-            obs_flat = obs_flat / self.OBS_SCALE
         if self.episode_step == 0:
             print(f"DEBUG OBS CPU at step 0: {obs_flat.tolist()}")
         return obs_flat

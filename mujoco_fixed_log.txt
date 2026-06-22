@@ -1,0 +1,41 @@
+Loading checkpoint: logs/franka-lift-v1/model_240.pt
+--------------------------------------------------------------------------------
+Resolved observation sets: 
+	 actor :  ['policy']
+	 critic :  ['policy']
+--------------------------------------------------------------------------------
+Actor Model: MLPModel(
+  (obs_normalizer): Identity()
+  (distribution): GaussianDistribution()
+  (mlp): MLP(
+    (0): Linear(in_features=10, out_features=256, bias=True)
+    (1): ELU(alpha=1.0)
+    (2): Linear(in_features=256, out_features=128, bias=True)
+    (3): ELU(alpha=1.0)
+    (4): Linear(in_features=128, out_features=64, bias=True)
+    (5): ELU(alpha=1.0)
+    (6): Linear(in_features=64, out_features=3, bias=True)
+  )
+)
+Critic Model: MLPModel(
+  (obs_normalizer): Identity()
+  (mlp): MLP(
+    (0): Linear(in_features=10, out_features=256, bias=True)
+    (1): ELU(alpha=1.0)
+    (2): Linear(in_features=256, out_features=128, bias=True)
+    (3): ELU(alpha=1.0)
+    (4): Linear(in_features=128, out_features=64, bias=True)
+    (5): ELU(alpha=1.0)
+    (6): Linear(in_features=64, out_features=1, bias=True)
+  )
+)
+DEBUG OBS at step 0: [0.854561984539032, -0.00025793828535825014, 0.0, 0.0, 0.08819101750850677, 0.09408771991729736, -0.000770300452131778, 5.000262717658188e-06, -0.00036982903839088976, 0.6880516409873962]
+target_dt=0.020s  sim_dt=0.001s  steps_per_target=20  playback_speed=0.50x
+Running one MuJoCo episode (max 10000 high-level steps) (checkpoint: model_240.pt)
+step     20  z=0.8526  z_vel=-0.245  z_acc=+0.00  |lf|=1.010  |rf|=1.011  cuboid_rel_z=-0.0002  desired=+0.0344  err=34.62mm  ep_rew=-7.4
+  [EP 1] len=15  reward=-257.1  fail reason=ee_z_high=0.9640
+Saved motion plot to /workspace/franka_policy_mujoco_motion.png
+Saved torque plot to /workspace/franka_policy_mujoco_motion_torques.png
+Saved reward plot to /workspace/franka_policy_mujoco_reward.png
+Saved reward parts plot to /workspace/franka_policy_mujoco_reward_parts.png
+Episode length: 15 high-level steps (300 sim steps)
