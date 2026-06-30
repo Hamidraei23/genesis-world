@@ -135,7 +135,7 @@ class FrankaEnvParallel:
     EE_HOLD_VEL_TOLERANCE = 0.02
     EE_HOLD_REQUIRED_STEPS = 5
     EE_HOLD_ACC_THRESHOLD = 2.0
-    PULSE_DELAY_STEPS = 2   # target-period steps to wait before the open window begins
+    PULSE_DELAY_STEPS = 1   # target-period steps to wait before the open window begins
     PULSE_DELAY_RANDOM_MIN = 0
     PULSE_DELAY_RANDOM_MAX = 1
     PULSE_LENGTH = 5   # steps: 5 open, 1 close, then back to policy control

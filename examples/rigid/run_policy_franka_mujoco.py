@@ -35,11 +35,14 @@ DEFAULT_REWARD_PLOT_FILE = REPO_ROOT / "franka_policy_mujoco_reward.png"
 DEFAULT_REWARD_PARTS_PLOT_FILE = REPO_ROOT / "franka_policy_mujoco_reward_parts.png"
 DEFAULT_SAVE_FILE = REPO_ROOT / "franka_policy_mujoco_z_vel.npy"
 REWARD_PARTS = (
-    ("tracking", "3*tracking"),
+    ("base_reward", "base_reward"),
+    ("regrasp_bonus", "regrasp_bonus"),
     ("jerk_penalty", "jerk_penalty"),
-    ("z_acc_penalty", "z_acc_penalty"),
-    ("grip", "0.5*grip"),
-    ("ee_z_penalty", "ee_z_penalty"),
+    ("z_improvement", "z_improvement"),
+    ("avg_force", "avg_force"),
+    ("regrasp_event", "regrasp_event"),
+    ("success_candidate", "success_candidate"),
+    ("success_steps", "success_steps"),
 )
 
 
@@ -361,6 +364,10 @@ def main():
     release_start_time = 0.0
     release_start_step = 0
     force_thresh = env.REGRASP_FORCE_THRESHOLD
+    post_pulse_hold_steps = max(1, int(round(0.5 / env.target_period)))
+    post_pulse_hold_remaining = 0
+    wait_for_post_pulse_direction_change = False
+    prev_policy_z_vel_sign = 0
 
     print(
         f"target_dt={env.target_period:.3f}s  sim_dt={env.dt:.3f}s  "
@@ -390,6 +397,34 @@ def main():
                     in_release = False
 
                 action = policy(obs_td).cpu().numpy().flatten()
+                policy_z_vel = action[0] * env.z_vel_max
+                if policy_z_vel > 1e-4:
+                    policy_z_vel_sign = 1
+                elif policy_z_vel < -1e-4:
+                    policy_z_vel_sign = -1
+                else:
+                    policy_z_vel_sign = 0
+
+                if (
+                    wait_for_post_pulse_direction_change
+                    and post_pulse_hold_remaining == 0
+                    and prev_policy_z_vel_sign != 0
+                    and policy_z_vel_sign != 0
+                    and policy_z_vel_sign != prev_policy_z_vel_sign
+                ):
+                    post_pulse_hold_remaining = post_pulse_hold_steps
+                    wait_for_post_pulse_direction_change = False
+
+                if policy_z_vel_sign != 0:
+                    prev_policy_z_vel_sign = policy_z_vel_sign
+
+                if post_pulse_hold_remaining > 0:
+                    action = action.copy()
+                    action[0] = 0.0
+                    action[1:] = -1.0
+                    post_pulse_hold_remaining -= 1
+
+                pulse_steps_before = env._gripper_pulse_steps
                 records, reward, done = env.step(action)
 
                 if args.save:
@@ -465,6 +500,13 @@ def main():
                     in_release = False
                     ep_reward = 0.0
                     ep_len = 0
+                    post_pulse_hold_remaining = 0
+                    wait_for_post_pulse_direction_change = False
+                    prev_policy_z_vel_sign = 0
+
+                else:
+                    if pulse_steps_before == 1:
+                        wait_for_post_pulse_direction_change = True
 
                 obs_flat = env.get_obs_flat()
                 obs_td = obs_to_tensordict(obs_flat, device, torch, tensor_dict_cls)

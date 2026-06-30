@@ -65,7 +65,7 @@ class FrankaEnvParallel:
     """
     Vectorised Franka environment.
 
-    Observations: flat tensor (N, OBS_DIM=10)
+    Observations: flat tensor (N, OBS_DIM=19)
         [0]    ee_pos_z
         [1]    ee_vel_z
         [2]    target_z_vel
@@ -76,11 +76,15 @@ class FrankaEnvParallel:
         [7]    cuboid_rel_x
         [8]    cuboid_rel_y
         [9]    desired_rel_z
-        
-        Future Observations (To be added):
-        [10]   last_pulse_gap_z_improve (LAST PULSE GAP z improvement)
-        [11]   pulse_gap_duration (Duration of gap derived from finger pos)
-        [12]   acc_drop_to_open_delay (Delay from the moment acceleration of EE goes below -10.0 to the moment end effector opens, in ms. Can be positive or negative)
+        [10]   last_regrasp_z_improvement
+        [11]   last_regrasp_pulse_gap_duration_ms
+        [12]   last_regrasp_pulse_start_delay_ms
+        [13]   previous_regrasp_z_improvement
+        [14]   previous_regrasp_pulse_gap_duration_ms
+        [15]   previous_regrasp_pulse_start_delay_ms
+        [16]   third_last_regrasp_z_improvement
+        [17]   third_last_regrasp_pulse_gap_duration_ms
+        [18]   third_last_regrasp_pulse_start_delay_ms
 
     Actions (per env, shape (N, action_dim=3)):
         [0]   target_z_vel
@@ -88,7 +92,7 @@ class FrankaEnvParallel:
     """
 
     # Observation layout constants
-    OBS_DIM            = 10
+    OBS_DIM            = 19
     OBS_EE_POS_Z       = 0
     OBS_EE_VEL_Z       = 1
     OBS_TARGET_Z_VEL   = 2
@@ -99,17 +103,30 @@ class FrankaEnvParallel:
     OBS_CUBOID_REL_X   = 7
     OBS_CUBOID_REL_Y   = 8
     OBS_DESIRED_REL_Z  = 9
-    # Future Observations (To be added):
-    # OBS_LAST_PULSE_GAP_Z_IMPROVE = 10
-    # OBS_PULSE_GAP_DURATION       = 11
-    # OBS_ACC_DROP_TO_OPEN_DELAY   = 12
+    OBS_REGRASP_HISTORY_START = 10
+    OBS_LAST_REGRASP_Z_IMPROVEMENT = 10
+    OBS_LAST_REGRASP_PULSE_GAP_DURATION_MS = 11
+    OBS_LAST_REGRASP_PULSE_START_DELAY_MS = 12
+    OBS_PREV_REGRASP_Z_IMPROVEMENT = 13
+    OBS_PREV_REGRASP_PULSE_GAP_DURATION_MS = 14
+    OBS_PREV_REGRASP_PULSE_START_DELAY_MS = 15
+    OBS_THIRD_LAST_REGRASP_Z_IMPROVEMENT = 16
+    OBS_THIRD_LAST_REGRASP_PULSE_GAP_DURATION_MS = 17
+    OBS_THIRD_LAST_REGRASP_PULSE_START_DELAY_MS = 18
+    REGRASP_HISTORY_SIZE = 3
+    REGRASP_HISTORY_FEATURES = 3
 
     # Fixed observation normalization scales (divide raw obs by these)
     # Order: ee_pos_z, ee_vel_z, target_z_vel, target_z_acc,
     #        left_force_mag, right_force_mag,
-    #        cuboid_rel_z, cuboid_rel_x, cuboid_rel_y, desired_rel_z
-    #        (Future: last_pulse_gap_z_improve, pulse_gap_duration, acc_drop_to_open_delay)
-    OBS_SCALE = [1.0, 0.6, 0.6, 15.0, 5.0, 5.0, 0.05, 0.05, 0.05, 0.05]
+    #        cuboid_rel_z, cuboid_rel_x, cuboid_rel_y, desired_rel_z,
+    #        then 3x [z_improvement, pulse_gap_duration_ms, pulse_start_delay_ms].
+    OBS_SCALE = [
+        1.0, 0.6, 0.6, 15.0, 5.0, 5.0, 0.05, 0.05, 0.05, 0.05,
+        0.05, 100.0, 100.0,
+        0.05, 100.0, 100.0,
+        0.05, 100.0, 100.0,
+    ]
 
     # Action scaling constants
     Z_VEL_MAX       = 0.6
@@ -135,12 +152,14 @@ class FrankaEnvParallel:
     EE_HOLD_VEL_TOLERANCE = 0.02
     EE_HOLD_REQUIRED_STEPS = 5
     EE_HOLD_ACC_THRESHOLD = 2.0
-    PULSE_DELAY_STEPS = 2   # target-period steps to wait before the open window begins
+    PULSE_DELAY_STEPS = 1   # target-period steps to wait before the open window begins
     PULSE_DELAY_RANDOM_MIN = 0
     PULSE_DELAY_RANDOM_MAX = 1
     PULSE_LENGTH = 5   # steps: 5 open, 1 close, then back to policy control
     PULSE_LENGTH_RANDOM_MIN = 4
     PULSE_LENGTH_RANDOM_MAX = 6
+    PULSE_FINGERTIP_OPEN_DELTA = 5e-4   # m above request-time gap to confirm actual opening
+    PULSE_FINGERTIP_MOTION_DELTA = 2e-5  # m per sim step, used to detect measured motion
     # Post-pulse hold penalty: after pulse completes, wait 0.5s, then penalise instability for 0.5s
     POST_PULSE_DELAY_DURATION = 0.5  # wait before evaluation window
     POST_PULSE_HOLD_DURATION = 0.5   # seconds
@@ -363,6 +382,9 @@ class FrankaEnvParallel:
             self._regrasp_duration_sum_steps = torch.zeros(N, dtype=torch.long, device=self.device)
             self._regrasp_duration_max_steps = torch.zeros(N, dtype=torch.long, device=self.device)
             self._regrasp_duration_steps = torch.zeros(N, 3, dtype=torch.long, device=self.device)
+            self._regrasp_history = torch.zeros(
+                N, self.REGRASP_HISTORY_SIZE, self.REGRASP_HISTORY_FEATURES, device=self.device
+            )
             # Consecutive firm-grasp step counter (used in success condition)
             self._firm_grasp_steps = torch.zeros(N, dtype=torch.long, device=self.device)
             self._success_steps = torch.zeros(N, dtype=torch.long, device=self.device)
@@ -383,6 +405,15 @@ class FrankaEnvParallel:
             self._gripper_pulse_delays = torch.full((N,), self.PULSE_DELAY_STEPS, dtype=torch.long, device=self.device)
             self._gripper_pulse_lengths = torch.full((N,), self.PULSE_LENGTH, dtype=torch.long, device=self.device)
             self._prev_gripper_avg = torch.full((N,), self.gripper_pos_min.mean().item(), device=self.device)
+            self._pulse_measure_state = torch.zeros(N, dtype=torch.long, device=self.device)
+            self._pulse_request_step = torch.full((N,), -1, dtype=torch.long, device=self.device)
+            self._pulse_open_start_step = torch.full((N,), -1, dtype=torch.long, device=self.device)
+            self._pulse_baseline_fingertip_dist = torch.zeros(N, device=self.device)
+            self._pulse_peak_fingertip_dist = torch.zeros(N, device=self.device)
+            self._pulse_prev_fingertip_dist = torch.zeros(N, device=self.device)
+            self._last_pulse_gap_duration_ms = torch.zeros(N, device=self.device)
+            self._last_pulse_start_delay_ms = torch.zeros(N, device=self.device)
+            self._pulse_metrics_valid = torch.zeros(N, dtype=torch.bool, device=self.device)
             # Post-pulse hold countdown: high-level steps remaining in the hold window
             _delay_hl_steps = max(1, int(round(self.POST_PULSE_DELAY_DURATION / self.target_period)))
             _hold_hl_steps = max(1, int(round(self.POST_PULSE_HOLD_DURATION / self.target_period)))
@@ -431,6 +462,7 @@ class FrankaEnvParallel:
         self._regrasp_duration_sum_steps[envs_idx] = 0
         self._regrasp_duration_max_steps[envs_idx] = 0
         self._regrasp_duration_steps[envs_idx] = 0
+        self._regrasp_history[envs_idx] = 0.0
         self._prev_cuboid_rel_z[envs_idx] = 0.0
         self._release_cuboid_rel_z[envs_idx] = 0.0
         self._firm_grasp_steps[envs_idx] = 0
@@ -447,6 +479,7 @@ class FrankaEnvParallel:
         self._sample_gripper_pulse_lengths(envs_idx)
         self._randomize_finger_gains(envs_idx)
         self._prev_gripper_avg[envs_idx] = self.gripper_pos_min.mean()
+        self._reset_pulse_measurement(envs_idx)
         self._post_pulse_delay_countdown[envs_idx] = 0
         self._post_pulse_hold_countdown[envs_idx] = 0
 
@@ -504,6 +537,7 @@ class FrankaEnvParallel:
         # Open region:   2 <= steps <= pulse_length → gripper_pos_max
         # Close step:    steps == 1                 → gripper_pos_min
         # Done:          steps == 0                 → policy
+        current_fingertip_dist = self.get_fingertip_distance()
         _pulse_start = self._gripper_pulse_lengths + self._gripper_pulse_delays
         _gp_mid = (self.gripper_pos_min + self.gripper_pos_max).mean() * 0.5  # scalar midpoint
         _gp_avg = gripper_pos.mean(dim=-1)                                     # (N,)
@@ -515,6 +549,7 @@ class FrankaEnvParallel:
         self._gripper_pulse_steps = torch.where(
             _rising, _pulse_start, self._gripper_pulse_steps
         )
+        self._mark_pulse_request(_rising, current_fingertip_dist)
         _gp_max_b = self.gripper_pos_max.unsqueeze(0).expand(self.num_envs, -1)  # (N, 2)
         _gp_min_b = self.gripper_pos_min.unsqueeze(0).expand(self.num_envs, -1)  # (N, 2)
         _in_open = (self._gripper_pulse_steps >= 2) & (
@@ -567,6 +602,7 @@ class FrankaEnvParallel:
                 update_visualizer=update_visualizer,
                 refresh_visualizer=refresh_visualizer,
             )
+            self._update_pulse_measurement(self.sim_step + local_step + 1)
 
         self.sim_step += self.target_update_every
         self.episode_length_buf += 1
@@ -616,11 +652,8 @@ class FrankaEnvParallel:
             (cuboid_pos[:, 0] - finger_mid[:, 0]).unsqueeze(-1) + _unoise((_N, 1)), # [7]    cuboid_rel_x
             (cuboid_pos[:, 1] - finger_mid[:, 1]).unsqueeze(-1) + _unoise((_N, 1)), # [8]    cuboid_rel_y
             self.desired_rel_z.unsqueeze(-1),                                        # [9]    desired_rel_z
-            # TODO: Future observations to be appended here:
-            # [10] last_pulse_gap_z_improve: LAST PULSE GAP z improvement
-            # [11] pulse_gap_duration: duration of gap derived from finger pos
-            # [12] acc_drop_to_open_delay: delay (ms) from EE acceleration going below -10.0 to EE open (can be +/-)
-        ], dim=-1)  # (N, 10)
+            self._regrasp_history.reshape(_N, -1),                                   # [10:19] last 3 regrasp metrics
+        ], dim=-1)  # (N, 19)
 
         if self.normalize:
             if not hasattr(self, '_obs_scale_t'):
@@ -741,6 +774,7 @@ class FrankaEnvParallel:
         z_err_before  = (self._release_cuboid_rel_z - self.desired_rel_z).abs()  # (N,)
         z_err_after   = (cuboid_rel_z               - self.desired_rel_z).abs()  # (N,)
         z_improvement = z_err_before - z_err_after                               # (N,) positive = closer
+        regrasp_history_entry = self._record_regrasp_history(regrasp_event, z_improvement)
         raw_regrasp_bonus = (z_improvement.clamp(min=-0.05) * 15000.0).clamp(max=250.0)
         raw_regrasp_bonus = torch.where(
             raw_regrasp_bonus < 0.0,
@@ -803,6 +837,8 @@ class FrankaEnvParallel:
             "success_candidate": success_candidate.float().detach().clone(),
             "success_steps": self._success_steps.float().detach().clone(),
             "post_pulse_hold_penalty": post_pulse_hold_penalty.detach().clone(),
+            "regrasp_history_entry": regrasp_history_entry.detach().clone(),
+            "regrasp_history": self._regrasp_history.detach().clone(),
         }
 
         return done, reward, timeout
@@ -841,6 +877,7 @@ class FrankaEnvParallel:
         self._regrasp_duration_sum_steps[envs_idx] = 0
         self._regrasp_duration_max_steps[envs_idx] = 0
         self._regrasp_duration_steps[envs_idx] = 0
+        self._regrasp_history[envs_idx] = 0.0
         self._prev_cuboid_rel_z[envs_idx] = 0.0
         self._release_cuboid_rel_z[envs_idx] = 0.0
         self._firm_grasp_steps[envs_idx] = 0
@@ -854,6 +891,7 @@ class FrankaEnvParallel:
         self._sample_gripper_pulse_lengths(envs_idx)
         self._randomize_finger_gains(envs_idx)
         self._prev_gripper_avg[envs_idx] = self.gripper_pos_min.mean()
+        self._reset_pulse_measurement(envs_idx)
         self._post_pulse_delay_countdown[envs_idx] = 0
         self._post_pulse_hold_countdown[envs_idx] = 0
         self._randomize_friction(envs_idx)
@@ -869,6 +907,146 @@ class FrankaEnvParallel:
     # ------------------------------------------------------------------ #
     # Internal: friction randomisation                                    #
     # ------------------------------------------------------------------ #
+
+    def _reset_pulse_measurement(self, envs_idx: torch.Tensor):
+        """Reset fingertip-derived pulse timing state for selected envs."""
+        fingertip_dist = self.get_fingertip_distance()
+        self._pulse_measure_state[envs_idx] = 0
+        self._pulse_request_step[envs_idx] = -1
+        self._pulse_open_start_step[envs_idx] = -1
+        self._pulse_baseline_fingertip_dist[envs_idx] = fingertip_dist[envs_idx]
+        self._pulse_peak_fingertip_dist[envs_idx] = fingertip_dist[envs_idx]
+        self._pulse_prev_fingertip_dist[envs_idx] = fingertip_dist[envs_idx]
+        self._last_pulse_gap_duration_ms[envs_idx] = 0.0
+        self._last_pulse_start_delay_ms[envs_idx] = 0.0
+        self._pulse_metrics_valid[envs_idx] = False
+
+    def _mark_pulse_request(self, requested: torch.Tensor, fingertip_dist: torch.Tensor):
+        """Start measuring a pulse from actual fingertip movement."""
+        request_step = torch.full_like(self._pulse_request_step, self.sim_step)
+        one = torch.ones_like(self._pulse_measure_state)
+        self._pulse_measure_state = torch.where(requested, one, self._pulse_measure_state)
+        self._pulse_request_step = torch.where(requested, request_step, self._pulse_request_step)
+        self._pulse_open_start_step = torch.where(
+            requested,
+            torch.full_like(self._pulse_open_start_step, -1),
+            self._pulse_open_start_step,
+        )
+        self._pulse_baseline_fingertip_dist = torch.where(
+            requested, fingertip_dist, self._pulse_baseline_fingertip_dist
+        )
+        self._pulse_peak_fingertip_dist = torch.where(requested, fingertip_dist, self._pulse_peak_fingertip_dist)
+        self._pulse_prev_fingertip_dist = torch.where(requested, fingertip_dist, self._pulse_prev_fingertip_dist)
+        self._last_pulse_gap_duration_ms = torch.where(
+            requested, torch.zeros_like(self._last_pulse_gap_duration_ms), self._last_pulse_gap_duration_ms
+        )
+        self._last_pulse_start_delay_ms = torch.where(
+            requested, torch.zeros_like(self._last_pulse_start_delay_ms), self._last_pulse_start_delay_ms
+        )
+        self._pulse_metrics_valid = torch.where(
+            requested, torch.zeros_like(self._pulse_metrics_valid), self._pulse_metrics_valid
+        )
+
+    def _update_pulse_measurement(self, sim_step: int):
+        """Measure pulse start delay and gap duration from fingertip-distance changes."""
+        fingertip_dist = self.get_fingertip_distance()
+        dist_delta = fingertip_dist - self._pulse_prev_fingertip_dist
+        sim_step_t = torch.full_like(self._pulse_request_step, sim_step)
+
+        waiting_open = self._pulse_measure_state == 1
+        moved_from_baseline = fingertip_dist > (
+            self._pulse_baseline_fingertip_dist + self.PULSE_FINGERTIP_MOTION_DELTA
+        )
+        opening_started = waiting_open & (
+            (fingertip_dist >= self._pulse_baseline_fingertip_dist + self.PULSE_FINGERTIP_OPEN_DELTA)
+            | ((dist_delta > self.PULSE_FINGERTIP_MOTION_DELTA) & moved_from_baseline)
+        )
+        delay_ms = (sim_step_t - self._pulse_request_step).clamp(min=0).float() * self.dt * 1000.0
+        self._last_pulse_start_delay_ms = torch.where(
+            opening_started, delay_ms, self._last_pulse_start_delay_ms
+        )
+        self._pulse_open_start_step = torch.where(
+            opening_started, sim_step_t, self._pulse_open_start_step
+        )
+
+        two = torch.full_like(self._pulse_measure_state, 2)
+        state_after_open = torch.where(opening_started, two, self._pulse_measure_state)
+        tracking_open = state_after_open == 2
+        self._pulse_peak_fingertip_dist = torch.where(
+            tracking_open,
+            torch.maximum(self._pulse_peak_fingertip_dist, fingertip_dist),
+            self._pulse_peak_fingertip_dist,
+        )
+
+        opened_enough = self._pulse_peak_fingertip_dist >= (
+            self._pulse_baseline_fingertip_dist + self.PULSE_FINGERTIP_OPEN_DELTA
+        )
+        closing_started = (
+            (self._pulse_measure_state == 2)
+            & opened_enough
+            & (dist_delta < -self.PULSE_FINGERTIP_MOTION_DELTA)
+            & ((self._pulse_peak_fingertip_dist - fingertip_dist) > self.PULSE_FINGERTIP_MOTION_DELTA)
+        )
+        duration_ms = (sim_step_t - self._pulse_open_start_step).clamp(min=0).float() * self.dt * 1000.0
+        self._last_pulse_gap_duration_ms = torch.where(
+            closing_started, duration_ms, self._last_pulse_gap_duration_ms
+        )
+        self._pulse_metrics_valid = torch.where(
+            closing_started, torch.ones_like(self._pulse_metrics_valid), self._pulse_metrics_valid
+        )
+        three = torch.full_like(self._pulse_measure_state, 3)
+        self._pulse_measure_state = torch.where(closing_started, three, state_after_open)
+        self._pulse_prev_fingertip_dist = fingertip_dist
+
+    def _finalize_pending_pulse_measurement(self, mask: torch.Tensor):
+        """Close an in-progress measured pulse at the current sim step for regrasp bookkeeping."""
+        pending_open = mask & (self._pulse_measure_state == 2)
+        sim_step_t = torch.full_like(self._pulse_request_step, self.sim_step)
+        duration_ms = (sim_step_t - self._pulse_open_start_step).clamp(min=0).float() * self.dt * 1000.0
+        self._last_pulse_gap_duration_ms = torch.where(
+            pending_open, duration_ms, self._last_pulse_gap_duration_ms
+        )
+        self._pulse_metrics_valid = torch.where(
+            pending_open, torch.ones_like(self._pulse_metrics_valid), self._pulse_metrics_valid
+        )
+        self._pulse_measure_state = torch.where(
+            pending_open, torch.full_like(self._pulse_measure_state, 3), self._pulse_measure_state
+        )
+
+    def _record_regrasp_history(self, regrasp_event: torch.Tensor, z_improvement: torch.Tensor) -> torch.Tensor:
+        """Push the latest force-confirmed regrasp metrics into the 3-event observation history."""
+        self._finalize_pending_pulse_measurement(regrasp_event)
+        valid_metrics = self._pulse_metrics_valid & regrasp_event
+        gap_ms = torch.where(
+            valid_metrics, self._last_pulse_gap_duration_ms, torch.zeros_like(self._last_pulse_gap_duration_ms)
+        )
+        delay_ms = torch.where(
+            valid_metrics, self._last_pulse_start_delay_ms, torch.zeros_like(self._last_pulse_start_delay_ms)
+        )
+        entry = torch.stack([z_improvement, gap_ms, delay_ms], dim=-1)
+        shifted_history = torch.cat([
+            entry.unsqueeze(1),
+            self._regrasp_history[:, : self.REGRASP_HISTORY_SIZE - 1, :],
+        ], dim=1)
+        event_mask = regrasp_event.view(self.num_envs, 1, 1)
+        self._regrasp_history = torch.where(event_mask, shifted_history, self._regrasp_history)
+
+        reset_long = torch.full_like(self._pulse_request_step, -1)
+        self._pulse_measure_state = torch.where(
+            regrasp_event, torch.zeros_like(self._pulse_measure_state), self._pulse_measure_state
+        )
+        self._pulse_request_step = torch.where(regrasp_event, reset_long, self._pulse_request_step)
+        self._pulse_open_start_step = torch.where(regrasp_event, reset_long, self._pulse_open_start_step)
+        self._last_pulse_gap_duration_ms = torch.where(
+            regrasp_event, torch.zeros_like(self._last_pulse_gap_duration_ms), self._last_pulse_gap_duration_ms
+        )
+        self._last_pulse_start_delay_ms = torch.where(
+            regrasp_event, torch.zeros_like(self._last_pulse_start_delay_ms), self._last_pulse_start_delay_ms
+        )
+        self._pulse_metrics_valid = torch.where(
+            regrasp_event, torch.zeros_like(self._pulse_metrics_valid), self._pulse_metrics_valid
+        )
+        return torch.where(regrasp_event.unsqueeze(-1), entry, torch.zeros_like(entry))
 
     def _randomize_friction(self, envs_idx: torch.Tensor):
         """
@@ -1111,11 +1289,17 @@ if __name__ == "__main__":
     parser.add_argument("--vis", action="store_true")
     parser.add_argument("--steps", type=int, default=50)
     parser.add_argument("--limit-regrasp", action="store_true")
+    parser.add_argument("--normalization", action="store_true")
     args = parser.parse_args()
 
     gs.init(backend=gs.gpu, precision="32", logging_level="warning")
 
-    env = FrankaEnvParallel(num_envs=args.num_envs, vis=args.vis, limit_regrasp=args.limit_regrasp)
+    env = FrankaEnvParallel(
+        num_envs=args.num_envs,
+        vis=args.vis,
+        limit_regrasp=args.limit_regrasp,
+        normalize=args.normalization,
+    )
     obs_td = env.reset()
     print("obs shape:", obs_td["policy"].shape)
     print("obs_dim:", FrankaEnvParallel.OBS_DIM)
