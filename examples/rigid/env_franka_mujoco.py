@@ -1,5 +1,4 @@
 import argparse
-import math
 import time
 import xml.etree.ElementTree as ET
 from dataclasses import dataclass
@@ -38,16 +37,33 @@ class FrankaMuJoCoEnv:
     Z_VEL_MAX = 0.6
     Z_ACC_MAX = 15.00
     Z_ACC_PENALTY_THRESHOLD = 13.0
-    Z_ACC_PENALTY_WEIGHT = 30.0
+    Z_ACC_PENALTY_WEIGHT = 0.0
     PULSE_DELAY_STEPS = 1   # target-period steps to wait before the open window begins
     EE_Z_TARGET = 0.7
     GRIPPER_CLOSED = 0.000251
     GRIPPER_OPEN = 0.0124
-    TRACKING_PERFECT = 20.0 * math.exp(-30.0 * 0.001)
     MAX_EPISODE_LENGTH = 450
 
+    FORCE_FREE_THRESHOLD = 0.15
     REGRASP_FORCE_THRESHOLD = 0.75
-    REGRASP_BONUS_PER_STEP = 10.0
+    AMBIGUOUS_FORCE_PENALTY = 10.0
+    FREE_FORCE_REWARD = 1.0
+    REGRASP_BONUS = 75.0
+    REGRASP_TERMINATION_COUNT = 4
+    FIRM_GRASP_SLIP_PENALTY_WEIGHT = 30.0
+    SUCCESS_EE_Z_MIN = 0.78
+    SUCCESS_EE_Z_MAX = 0.82
+    SUCCESS_REQUIRED_STEPS = 1
+    EE_HOLD_Z_TARGET = 0.8
+    EE_HOLD_Z_TOLERANCE = 0.025
+    EE_HOLD_VEL_TOLERANCE = 0.02
+    EE_HOLD_REQUIRED_STEPS = 5
+    EE_HOLD_ACC_THRESHOLD = 2.0
+    FINGER_GAIN_RANDOM_MIN = 100.0
+    FINGER_GAIN_RANDOM_MAX = 500.0
+    FRICTION_BASE = 0.75
+    FRICTION_MIN = 0.6
+    FRICTION_MAX = 0.90
 
     def __init__(
         self,
@@ -60,9 +76,12 @@ class FrankaMuJoCoEnv:
         gripper_pos_min=0.00000000251,
         gripper_pos_max=0.0124,
         solid_up: bool = False,
+        mix: bool = False,
         gravity_compensation: bool = True,
         debug: bool = False,
+        randomize: bool = False,
         normalize: bool = False,
+        limit_regrasp: bool = False,
     ):
         if playback_speed <= 0.0:
             raise ValueError("playback_speed must be greater than 0")
@@ -76,11 +95,14 @@ class FrankaMuJoCoEnv:
         self.render_every = max(1, int(round(1.0 / (render_fps * dt))))
         self.playback_speed = playback_speed
         self.action_dim = 3
-        self.z_vel_max = 0.7
+        self.z_vel_max = 0.6
         self.solid_up = solid_up
+        self.mix = mix
         self.gravity_compensation = gravity_compensation
         self.debug = debug
+        self.randomize = randomize
         self.normalize = normalize
+        self.limit_regrasp = limit_regrasp
 
         self.gripper_pos_min = np.broadcast_to(np.asarray(gripper_pos_min, dtype=float), (2,)).copy()
         self.gripper_pos_max = np.broadcast_to(np.asarray(gripper_pos_max, dtype=float), (2,)).copy()
@@ -89,6 +111,10 @@ class FrankaMuJoCoEnv:
 
         self.model = _build_franka_lift_model(dt=dt)
         self.data = mujoco.MjData(self.model)
+        self._base_geom_friction = self.model.geom_friction.copy()
+        self._base_actuator_gainprm = self.model.actuator_gainprm.copy()
+        self._base_actuator_biasprm = self.model.actuator_biasprm.copy()
+        self._base_actuator_forcerange = self.model.actuator_forcerange.copy()
         self.viewer = self._launch_viewer() if vis else None
 
         self.motors_dof = np.arange(7)
@@ -156,15 +182,34 @@ class FrankaMuJoCoEnv:
         self.sim_step = 0
         self.episode_step = 0
         mag = 0.02 + np.random.uniform() * 0.02
-        self.desired_rel_z = -mag if self.solid_up else mag
+        # mag = 0.0375
+        if self.mix:
+            self.desired_rel_z = mag if np.random.uniform() < 0.5 else -mag
+        elif self.solid_up:
+            self.desired_rel_z = -mag
+        else:
+            self.desired_rel_z = mag
         self.prev_actual_z_vel = None
         self.prev_torque = None
         self.direction_change_count = 0
         self._in_release = False
-        self._release_step_count = 0
         self._regrasp_count = 0
+        self._release_start_step = -1
+        self._last_regrasp_duration_steps = 0
+        self._regrasp_duration_sum_steps = 0
+        self._regrasp_duration_max_steps = 0
+        self._regrasp_duration_steps = np.zeros(3, dtype=np.int64)
+        self._firm_grasp_steps = 0
+        self._success_steps = 0
+        self._pre_success = False
+        self._ee_hold_steps = 0
+        self._ee_hold_complete = False
+        self._prev_cuboid_rel_z = 0.0
+        self._release_cuboid_rel_z = 0.0
         self._prev_gripper_avg = -1.0
         self._gripper_pulse_steps = 0
+        self._randomize_friction()
+        self._randomize_finger_gains()
 
         for i in range(warmup_steps):
             self.data.ctrl[:7] = self.q_home[:7]
@@ -173,11 +218,14 @@ class FrankaMuJoCoEnv:
             mujoco.mj_step(self.model, self.data)
             self._sync_viewer(i)
 
+        if self.randomize:
+            self.data.qvel[:7] = (np.random.uniform(size=7) * 2.0 - 1.0) * 0.01
+            mujoco.mj_forward(self.model, self.data)
+
         self.controller.reset_playback_clock()
-        self._store_initial_z_error()
         return self.get_observation()
 
-    def step(self, action):
+    def step(self, action, *, auto_reset: bool = True):
         action = np.asarray(action, dtype=float).reshape(-1)
         if action.shape != (self.action_dim,):
             raise ValueError(f"action must have shape ({self.action_dim},), got {action.shape}")
@@ -192,7 +240,7 @@ class FrankaMuJoCoEnv:
         )
 
         # --- GRIPPER PULSE LOGIC ---
-        _pulse_start = 6 + self.PULSE_DELAY_STEPS
+        _pulse_start = 5 + self.PULSE_DELAY_STEPS
         _gp_mid = (np.mean(self.gripper_pos_min) + np.mean(self.gripper_pos_max)) * 0.5
         _gp_avg = np.mean(gripper_pos)
         _rising = (
@@ -232,7 +280,7 @@ class FrankaMuJoCoEnv:
         self.episode_step += 1
 
         done, reward = self._compute_done_and_reward()
-        if done:
+        if done and auto_reset:
             self.reset(warmup_steps=0)
         return records, reward, done
 
@@ -284,9 +332,12 @@ class FrankaMuJoCoEnv:
             ],
             dtype=np.float32,
         )
+        if self.randomize:
+            noise = (np.random.uniform(size=5).astype(np.float32) * 2.0 - 1.0) * 0.003
+            obs_array[[0, 1, 6, 7, 8]] += noise
         if self.normalize:
             obs_array = obs_array / self.OBS_SCALE
-        if self.episode_step == 0:
+        if self.debug and self.episode_step == 0:
             print(f"DEBUG OBS at step 0: {obs_array.tolist()}")
         return obs_array
 
@@ -372,17 +423,55 @@ class FrankaMuJoCoEnv:
         fingertip_dist = float(np.linalg.norm(left_ft - right_ft))
         ee_z = float(ee_pos[2])
         ee_vel_z = float(ee_vel[2])
+        left_force, right_force = self.get_finger_net_contact_forces()
+        left_force_mag = float(np.linalg.norm(left_force))
+        right_force_mag = float(np.linalg.norm(right_force))
+        avg_force = (left_force_mag + right_force_mag) * 0.5
 
         timeout = self.episode_step >= self.MAX_EPISODE_LENGTH
-        success = (not timeout) and (abs(cuboid_rel_z - self.desired_rel_z) <= 0.01 and abs(ee_vel_z) < 0.04)
+
+        firm_grasp_now = avg_force >= self.REGRASP_FORCE_THRESHOLD
+        self._firm_grasp_steps = self._firm_grasp_steps + 1 if firm_grasp_now else 0
+
+        success_candidate = (
+            (not timeout)
+            and (abs(cuboid_rel_z - self.desired_rel_z) <= 0.005)
+            and (abs(ee_vel_z) < 0.02)
+            and (self._firm_grasp_steps >= 3)
+            and (ee_z >= self.SUCCESS_EE_Z_MIN)
+            and (ee_z <= self.SUCCESS_EE_Z_MAX)
+        )
         fail = (
-            abs(cuboid_rel_x) > 0.015
-            or abs(cuboid_rel_y) > 0.015
-            or fingertip_dist < 0.02
+            abs(cuboid_rel_x) > 0.04
+            or abs(cuboid_rel_y) > 0.04
+            or fingertip_dist < 0.01
             or abs(cuboid_rel_z) > 0.15
             or ee_z < 0.6
             or ee_z > 0.96
         )
+
+        firm_grasp = firm_grasp_now
+        fully_released = avg_force < self.FORCE_FREE_THRESHOLD
+
+        release_start = fully_released and (not self._in_release)
+        if release_start:
+            self._release_start_step = self.episode_step
+            self._release_cuboid_rel_z = cuboid_rel_z
+
+        regrasp_event = self._in_release and firm_grasp
+        self._in_release = (self._in_release or fully_released) and (not regrasp_event)
+
+        if self.limit_regrasp:
+            limit_fail = regrasp_event and (self._regrasp_count + 1 >= self.REGRASP_TERMINATION_COUNT)
+            fail = fail or limit_fail
+            success_candidate = success_candidate and (not limit_fail)
+
+        success_candidate = success_candidate and (not fail)
+        self._success_steps = self._success_steps + 1 if success_candidate else 0
+        success = self._success_steps >= self.SUCCESS_REQUIRED_STEPS
+
+        done = timeout or success or fail
+        self._regrasp_count += int(regrasp_event)
 
         if self.debug:
             print(
@@ -399,15 +488,15 @@ class FrankaMuJoCoEnv:
             )
 
         fail_reasons = []
-        if abs(cuboid_rel_x) > 0.015:
+        if abs(cuboid_rel_x) > 0.04:
             fail_reasons.append(f"cuboid_rel_x={cuboid_rel_x:+.4f}")
-        if abs(cuboid_rel_y) > 0.015:
+        if abs(cuboid_rel_y) > 0.04:
             fail_reasons.append(f"cuboid_rel_y={cuboid_rel_y:+.4f}")
-        if fingertip_dist < 0.02:
+        if fingertip_dist < 0.01:
             fail_reasons.append(f"fingertip_dist={fingertip_dist:.4f}")
         if abs(cuboid_rel_z) > 0.15:
             fail_reasons.append(f"cuboid_rel_z={cuboid_rel_z:+.4f}")
-        if ee_z < 0.76:
+        if ee_z < 0.6:
             fail_reasons.append(f"ee_z_low={ee_z:.4f}")
         if ee_z > 0.96:
             fail_reasons.append(f"ee_z_high={ee_z:.4f}")
@@ -421,74 +510,38 @@ class FrankaMuJoCoEnv:
         else:
             self.last_done_reason = None
 
-        z_error = abs(cuboid_rel_z - self.desired_rel_z)
-        tracking_raw = 20.0 * math.exp(-30.0 * z_error)
-        denom = max(self.TRACKING_PERFECT - self.initial_tracking, 1e-6)
-        tracking = max(0.0, min(1.0, (tracking_raw - self.initial_tracking) / denom))
-        if self.debug:
-            print(f"z_error={z_error:.4f}  tracking={tracking:.2f}")
+        z_err_before = abs(self._release_cuboid_rel_z - self.desired_rel_z)
+        z_err_after = abs(cuboid_rel_z - self.desired_rel_z)
+        z_improvement = z_err_before - z_err_after
+        raw_regrasp_bonus = min(max(z_improvement, -0.05) * 15000.0, 250.0)
+        if raw_regrasp_bonus < 0.0:
+            raw_regrasp_bonus *= 5.0
+        regrasp_bonus = raw_regrasp_bonus * float(regrasp_event)
 
         jerk = (self.target_z_vel - self.prev_target_z_vel) / self.Z_VEL_MAX
-        jerk_penalty = -0.2 * jerk**2
-
-        commanded_z_acc = (self.target_z_vel - self.prev_target_z_vel) / self.target_period
-        z_acc_excess = max(0.0, abs(commanded_z_acc) - self.Z_ACC_PENALTY_THRESHOLD)
-        z_acc_penalty = -self.Z_ACC_PENALTY_WEIGHT * z_acc_excess / 8.0
-
-        grip = math.exp(-200.0 * max(0.0, fingertip_dist - 0.03))
-
-        left_force, right_force = self.get_finger_net_contact_forces()
-        avg_finger_force = (np.linalg.norm(left_force) + np.linalg.norm(right_force)) * 0.5
-        currently_released = avg_finger_force < self.REGRASP_FORCE_THRESHOLD
-        if self._in_release:
-            self._release_step_count += 1
-        exiting_release = self._in_release and not currently_released
-        if exiting_release and self._regrasp_count < 2:
-            regrasp_bonus = self._release_step_count * self.REGRASP_BONUS_PER_STEP * 2.0
-        else:
-            regrasp_bonus = 0.0
-        if exiting_release:
-            self._regrasp_count += 1
-            self._release_step_count = 0
-        self._in_release = currently_released
+        jerk_penalty = -1.0 * jerk**2
 
         ep = float(self.episode_step)
         if success:
-            base_reward = 500.0 - ep * 0.1
+            base_reward = 1000.0 - ep * 0.5
         elif fail or timeout:
             base_reward = -250.0
         else:
-            base_reward = -0.00075
+            base_reward = -0.25
 
-        ee_z_penalty = -0.35 * max(ee_z - 0.86, 0.0)
         self.last_reward_terms = {
-            "tracking": 3.0 * tracking,
-            "jerk_penalty": jerk_penalty,
-            "z_acc_penalty": z_acc_penalty,
-            "grip": 0.5 * grip,
-            "ee_z_penalty": ee_z_penalty,
+            "base_reward": base_reward,
             "regrasp_bonus": regrasp_bonus,
+            "jerk_penalty": jerk_penalty,
+            "z_improvement": z_improvement,
+            "avg_force": avg_force,
+            "regrasp_event": float(regrasp_event),
+            "success_candidate": float(success_candidate),
+            "success_steps": float(self._success_steps),
         }
 
-        reward = (
-            base_reward
-            + 3.0 * tracking
-            + jerk_penalty
-            + z_acc_penalty
-            + 0.5 * grip
-            + ee_z_penalty
-            + regrasp_bonus
-        )
-        return timeout or success or fail, reward
-
-    def _store_initial_z_error(self):
-        cuboid_pos = self._body_pos(self.cuboid_body_id)
-        left_ft = self.get_fingertip_pos(self.left_finger_body_id)
-        right_ft = self.get_fingertip_pos(self.right_finger_body_id)
-        finger_mid = (left_ft + right_ft) / 2.0
-        err = abs(cuboid_pos[2] - finger_mid[2] - self.desired_rel_z)
-        self.initial_z_error = max(err, 1e-3)
-        self.initial_tracking = 20.0 * math.exp(-30.0 * self.initial_z_error)
+        reward = base_reward + regrasp_bonus + jerk_penalty
+        return done, reward
 
     def _reset_cuboid_home_pose(self):
         hand_pos = self._body_pos(self.hand_body_id)
@@ -503,6 +556,33 @@ class FrankaMuJoCoEnv:
         self.data.qpos[self.cuboid_qposadr + 3 : self.cuboid_qposadr + 7] = cuboid_home_quat
         self.data.qvel[self.cuboid_dofadr : self.cuboid_dofadr + 6] = 0.0
         mujoco.mj_forward(self.model, self.data)
+
+    def _randomize_friction(self):
+        if not self.randomize:
+            self.model.geom_friction[:] = self._base_geom_friction
+            return
+
+        ratio_min = self.FRICTION_MIN / self.FRICTION_BASE
+        ratio_max = self.FRICTION_MAX / self.FRICTION_BASE
+        ratio = ratio_min + np.random.uniform() * (ratio_max - ratio_min)
+        self.model.geom_friction[:] = self._base_geom_friction
+        self.model.geom_friction[:, 0] *= ratio
+
+    def _randomize_finger_gains(self):
+        self.model.actuator_gainprm[:] = self._base_actuator_gainprm
+        self.model.actuator_biasprm[:] = self._base_actuator_biasprm
+        self.model.actuator_forcerange[:] = self._base_actuator_forcerange
+        if not self.randomize:
+            return
+
+        value = self.FINGER_GAIN_RANDOM_MIN + np.random.uniform() * (
+            self.FINGER_GAIN_RANDOM_MAX - self.FINGER_GAIN_RANDOM_MIN
+        )
+        self.model.actuator_gainprm[self.finger_actuators, 0] = value
+        self.model.actuator_biasprm[self.finger_actuators, 1] = -value
+        self.model.actuator_biasprm[self.finger_actuators, 2] = -25.0
+        self.model.actuator_forcerange[self.finger_actuators, 0] = -value
+        self.model.actuator_forcerange[self.finger_actuators, 1] = value
 
     def _apply_arm_gravity_compensation(self):
         self.data.qfrc_applied[:] = 0.0
@@ -746,7 +826,7 @@ def compute_ee_velocity_command_and_jacobian(
     error_pos = target_pos - data.xpos[hand_body_id]
 
     ee_quat = data.xquat[hand_body_id].copy()
-    error_quat = _quat_mul(_inv_quat(ee_quat), target_quat)
+    error_quat = _quat_mul(target_quat, _inv_quat(ee_quat))
     error_rotvec = _quat_to_rotvec(error_quat)
 
     ee_velocity_cmd = np.concatenate(
