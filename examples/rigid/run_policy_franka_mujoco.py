@@ -282,6 +282,12 @@ def main():
         default=False,
         help="Enable fixed observation normalization (must match training setting)",
     )
+    parser.add_argument(
+        "--zero",
+        action="store_true",
+        default=False,
+        help="Enable post-pulse zero-z-velocity + close-gripper hold in env",
+    )
     parser.add_argument("--save", action="store_true", default=False, help="Save policy z_vel outputs to a .npy file.")
     parser.add_argument("--save-file", type=str, default=str(DEFAULT_SAVE_FILE))
     args = parser.parse_args()
@@ -308,6 +314,7 @@ def main():
         playback_speed=args.playback_speed,
         solid_up=args.negative,
         normalize=args.normalization,
+        zero=args.zero,
     )
 
     runner = runner_cls(_RunnerEnvProxy(torch, tensor_dict_cls), train_cfg, log_dir, device=device)

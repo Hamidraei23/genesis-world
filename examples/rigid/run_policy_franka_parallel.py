@@ -64,6 +64,10 @@ def main():
                         help="Total high-level steps to run (0 = run until Ctrl-C)")
     parser.add_argument("--dt", type=float, default=0.001)
     parser.add_argument("--target_dt", type=float, default=0.02)
+    parser.add_argument("--replay-speed", type=float, default=4.0,
+                        help="Viewer playback speed multiplier. Use 1.0 for real time.")
+    parser.add_argument("--render-every", type=int, default=1,
+                        help="Refresh the interactive viewer every N high-level policy steps.")
     parser.add_argument("--plot", action="store_true", default=False,
                         help="Generate and save a diagnostic plot after each episode")
     parser.add_argument("--limit-regrasp", "--limit-grasp", dest="limit_regrasp", action="store_true",
@@ -74,10 +78,16 @@ def main():
                         help="Enable fixed observation normalization (must match training setting)")
     parser.add_argument("--randomize", action="store_true", default=False,
                         help="Enable domain randomization (must match training setting)")
+    parser.add_argument("--zero", action="store_true", default=False,
+                        help="After a gripper pulse, temporarily zero z velocity and close the gripper")
     args = parser.parse_args()
 
     if args.record:
         args.vis = False
+    if args.replay_speed <= 0.0:
+        raise ValueError("--replay-speed must be greater than 0")
+    if args.render_every <= 0:
+        raise ValueError("--render-every must be greater than 0")
 
     log_dir = f"logs/{args.exp_name}"
 
@@ -126,6 +136,50 @@ def main():
         "jerk_penalty", "z_acc_penalty", "ee_z_penalty",
         "regrasp_bonus", "no_regrasp_penalty",
     )
+    REGRASP_PLOT_KEYS = ("z_improvement", "regrasp_bonus")
+    ROLLOUT_TERM_KEYS = tuple(dict.fromkeys((*REWARD_PART_KEYS, *REGRASP_PLOT_KEYS)))
+
+    def _obs_scale_for(obs: torch.Tensor) -> torch.Tensor:
+        """Return fixed normalization scales aligned to the active observation width."""
+        scale = torch.tensor(FrankaEnvParallel.OBS_SCALE, device=obs.device, dtype=obs.dtype)
+        obs_dim = obs.shape[-1]
+        if scale.numel() == obs_dim:
+            return scale
+        if scale.numel() > obs_dim:
+            return scale[:obs_dim]
+        pad = torch.ones(obs_dim - scale.numel(), device=obs.device, dtype=obs.dtype)
+        return torch.cat([scale, pad], dim=0)
+
+    def _reward_term_scalar(value, env_index: int = 0):
+        """Extract one scalar for this env; return None for vector/matrix debug tensors."""
+        if value is None:
+            return None
+        if torch.is_tensor(value):
+            t = value.detach()
+            if t.numel() == 0:
+                return None
+            if t.ndim > 0:
+                t = t[env_index] if t.shape[0] > env_index else t.reshape(-1)[0]
+            return t.reshape(()).item() if t.numel() == 1 else None
+
+        arr = np.asarray(value)
+        if arr.size == 0:
+            return None
+        if arr.ndim > 0:
+            arr = arr[env_index] if arr.shape[0] > env_index else arr.reshape(-1)[0]
+        return float(arr.reshape(())) if arr.size == 1 else None
+
+    def _reward_term_float(value, default: float = 0.0) -> float:
+        scalar = _reward_term_scalar(value)
+        return default if scalar is None else float(scalar)
+
+    def _format_reward_term(key: str, value) -> str:
+        scalar = _reward_term_scalar(value)
+        if scalar is not None:
+            return f"{key}={float(scalar):.3f}"
+        if torch.is_tensor(value):
+            return f"{key}=tensor{tuple(value.shape)}"
+        return f"{key}=array{np.asarray(value).shape}"
 
     # ---- per-episode data buffers ----------------------------------------
     def _fresh_buffers():
@@ -136,7 +190,7 @@ def main():
             target_z=[], actual_z_vel=[], target_z_vel=[],
             target_z_acc=[], actual_z_acc=[], z_error=[],
         )
-        for k in REWARD_PART_KEYS:
+        for k in ROLLOUT_TERM_KEYS:
             d[k] = []
         return d
 
@@ -267,10 +321,41 @@ def main():
         plt.close(fig)
         print(f"  [PLOT] rew parts → {path}")
 
+    def _plot_regrasp(bufs, release_spans, ep_idx, save_dir):
+        """Plot 4 – regrasp-specific metrics."""
+        steps = np.asarray(bufs["steps"])
+        z_improvement = np.asarray(bufs["z_improvement"])
+        regrasp_bonus = np.asarray(bufs["regrasp_bonus"])
+
+        fig, axes = plt.subplots(2, 1, figsize=(12, 7), sharex=True)
+        fig.suptitle(f"Episode {ep_idx} — Regrasp detail  (orange = gripper release)", fontsize=12)
+
+        panels = [
+            (axes[0], z_improvement, "z_improvement", "Z improvement [m]", "C0"),
+            (axes[1], regrasp_bonus, "regrasp_bonus", "Reward", "C1"),
+        ]
+        for ax, vals, label, ylabel, color in panels:
+            ax.plot(steps, vals, color=color, linewidth=1.2, label=label)
+            ax.axhline(0, color="k", linewidth=0.5, linestyle="--")
+            _shade_releases(ax, release_spans)
+            ax.set_ylabel(ylabel)
+            ax.set_title(label, fontsize=9)
+            ax.legend(fontsize=7, loc="upper left")
+            ax.grid(True, linewidth=0.4, alpha=0.5)
+
+        axes[-1].set_xlabel("High-level step")
+        plt.tight_layout()
+        os.makedirs(save_dir, exist_ok=True)
+        path = os.path.join(save_dir, f"ep_{ep_idx:03d}_regrasp.png")
+        fig.savefig(path, dpi=120)
+        plt.close(fig)
+        print(f"  [PLOT] regrasp  → {path}")
+
     def _save_all_plots(bufs, release_spans, ep_idx, save_dir):
         _plot_episode(bufs, release_spans, ep_idx, save_dir)
         _plot_motion(bufs, release_spans, ep_idx, save_dir)
         _plot_reward_parts(bufs, release_spans, ep_idx, save_dir)
+        _plot_regrasp(bufs, release_spans, ep_idx, save_dir)
 
     def _append_rollout_sample(bufs, obs, env, step_idx, reward_value, reward_terms, target_z, actual_z_acc):
         """
@@ -305,9 +390,9 @@ def main():
         bufs["actual_z_acc"].append(actual_z_acc)
         bufs["z_error"].append(abs(cub_rel_z - des_rel_z))
         # reward parts
-        for rk in REWARD_PART_KEYS:
+        for rk in ROLLOUT_TERM_KEYS:
             v = reward_terms.get(rk)
-            bufs[rk].append(float(v[0]) if v is not None else 0.0)
+            bufs[rk].append(_reward_term_float(v))
 
         return {
             "actual_z": bufs["ee_z"][-1],
@@ -338,10 +423,15 @@ def main():
     _in_release = False
     _release_start = 0
     _force_thresh = env.REGRASP_FORCE_THRESHOLD
+    post_pulse_hold_steps = max(1, int(round(0.5 / env.target_period)))
+    post_pulse_hold_remaining = 0
+    wait_for_post_pulse_direction_change = False
+    prev_policy_z_vel_sign = 0
 
     print(
         f"target_dt={env.target_period:.3f}s  sim_dt={env.dt:.3f}s  "
-        f"steps_per_target={env.target_update_every}"
+        f"steps_per_target={env.target_update_every}  replay_speed={args.replay_speed:.2f}x  "
+        f"render_every={args.render_every}"
     )
     print(f"Running {'forever' if args.steps == 0 else high_level_steps} high-level steps...")
 
@@ -353,8 +443,7 @@ def main():
                 # next episode's first observation when reset_buf is true.
                 obs = obs_td["policy"].clone()  # (1, OBS_DIM)
                 if env.normalize:
-                    obs_scale = torch.tensor(FrankaEnvParallel.OBS_SCALE, device=gs.device)
-                    unnorm_obs = obs * obs_scale
+                    unnorm_obs = obs * _obs_scale_for(obs)
                 else:
                     unnorm_obs = obs
                     
@@ -367,11 +456,41 @@ def main():
                 prev_actual_z_vel = actual_z_vel_cur
 
                 actions = policy(obs_td)
-                obs_td, rew_buf, reset_buf, _ = env.step(actions)
+                pulse_steps_before = None
+                if args.zero:
+                    policy_z_vel = actions[0, 0].item() * env.Z_VEL_MAX
+                    if policy_z_vel > 1e-4:
+                        policy_z_vel_sign = 1
+                    elif policy_z_vel < -1e-4:
+                        policy_z_vel_sign = -1
+                    else:
+                        policy_z_vel_sign = 0
+
+                    if (
+                        wait_for_post_pulse_direction_change
+                        and post_pulse_hold_remaining == 0
+                        and prev_policy_z_vel_sign != 0
+                        and policy_z_vel_sign != 0
+                        and policy_z_vel_sign != prev_policy_z_vel_sign
+                    ):
+                        post_pulse_hold_remaining = post_pulse_hold_steps
+                        wait_for_post_pulse_direction_change = False
+
+                    if policy_z_vel_sign != 0:
+                        prev_policy_z_vel_sign = policy_z_vel_sign
+
+                    if post_pulse_hold_remaining > 0:
+                        actions = actions.clone()
+                        actions[:, 0] = 0.0
+                        actions[:, 1:] = -1.0
+                        post_pulse_hold_remaining -= 1
+
+                    pulse_steps_before = env._gripper_pulse_steps[0].item()
+                obs_td, rew_buf, reset_buf, _ = env.step(actions, update_visualizer=not args.vis)
 
                 reward_cur = rew_buf[0].item()
                 parts_str = "  ".join(
-                    f"{k}={float(v):.3f}" for k, v in env.last_reward_terms.items()
+                    _format_reward_term(k, v) for k, v in env.last_reward_terms.items()
                 )
                 print(f"current reward is {reward_cur:.3f}  [{parts_str}]")
                 # ---- per-step observation printout -----------------------
@@ -416,12 +535,22 @@ def main():
                         release_spans.append((_release_start, ep_len))
                         _in_release = False
 
-                    success = ep_reward > 0
+                    success = _reward_term_float(env.last_reward_terms.get("success"), 0.0) > 0.5
+                    fail = _reward_term_float(env.last_reward_terms.get("fail"), 0.0) > 0.5
+                    timeout = _reward_term_float(env.last_reward_terms.get("timeout"), 0.0) > 0.5
+                    if success:
+                        outcome = "SUCCESS"
+                    elif fail:
+                        outcome = "fail"
+                    elif timeout:
+                        outcome = "timeout"
+                    else:
+                        outcome = "done"
                     ep_count += 1
                     print(
                         f"  [EP {ep_count}] len={ep_len}  reward={ep_reward:.1f}  "
                         f"regrasps={len(release_spans)}  "
-                        f"{'SUCCESS' if success else 'fail'}"
+                        f"{outcome}"
                     )
 
                     if args.plot and bufs["steps"]:
@@ -436,8 +565,14 @@ def main():
                     ep_len = 0
                     prev_actual_z_vel = None
                     prev_print_z_vel  = None
+                    post_pulse_hold_remaining = 0
+                    wait_for_post_pulse_direction_change = False
+                    prev_policy_z_vel_sign = 0
 
-                elif i % 100 == 0:
+                elif args.zero and pulse_steps_before == 1:
+                    wait_for_post_pulse_direction_change = True
+
+                if (not reset_buf[0].item()) and i % 100 == 0:
                     actual_z      = sample["actual_z"]
                     ft_dist       = sample["ft_dist"]
                     cuboid_rel_z  = sample["cuboid_rel_z"]
@@ -456,12 +591,13 @@ def main():
                         f"ep_rew={ep_reward:.1f}  z_vel={actual_z_vel_cur:+.3f}"
                     )
 
-                # Real-time pacing when viewer is open
-                if args.vis:
-                    t_sim = env.sim_step * env.dt
+                # Refresh the viewer at the replay cadence, not on every 1 ms physics step.
+                if args.vis and (i + 1) % args.render_every == 0:
+                    t_sim = env.sim_step * env.dt / args.replay_speed
                     t_wall = time.perf_counter() - t_real_start
                     if t_wall < t_sim:
                         time.sleep(t_sim - t_wall)
+                    env.scene.visualizer.update(force=False, auto=True)
 
                 i += 1
 

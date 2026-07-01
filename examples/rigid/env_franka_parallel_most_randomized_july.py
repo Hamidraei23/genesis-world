@@ -65,7 +65,7 @@ class FrankaEnvParallel:
     """
     Vectorised Franka environment.
 
-    Observations: flat tensor (N, OBS_DIM=25)
+    Observations: flat tensor (N, OBS_DIM=10)
         [0]    ee_pos_z
         [1]    ee_vel_z
         [2]    target_z_vel
@@ -76,9 +76,11 @@ class FrankaEnvParallel:
         [7]    cuboid_rel_x
         [8]    cuboid_rel_y
         [9]    desired_rel_z
-        [10:15]  last 5 z_improvement values (oldest → newest)
-        [15:20]  last 5 time-to-next(ee_vel_z < 0) after pulse-open, in ms (oldest → newest)
-        [20:25]  last 5 time-to-last(ee_vel_z < 0) after pulse-open, in ms (oldest → newest)
+        
+        Future Observations (To be added):
+        [10]   last_pulse_gap_z_improve (LAST PULSE GAP z improvement)
+        [11]   pulse_gap_duration (Duration of gap derived from finger pos)
+        [12]   acc_drop_to_open_delay (Delay from the moment acceleration of EE goes below -10.0 to the moment end effector opens, in ms. Can be positive or negative)
 
     Actions (per env, shape (N, action_dim=3)):
         [0]   target_z_vel
@@ -86,8 +88,7 @@ class FrankaEnvParallel:
     """
 
     # Observation layout constants
-    OBS_DIM            = 25
-    HISTORY_LEN        = 5
+    OBS_DIM            = 10
     OBS_EE_POS_Z       = 0
     OBS_EE_VEL_Z       = 1
     OBS_TARGET_Z_VEL   = 2
@@ -98,23 +99,17 @@ class FrankaEnvParallel:
     OBS_CUBOID_REL_X   = 7
     OBS_CUBOID_REL_Y   = 8
     OBS_DESIRED_REL_Z  = 9
-    OBS_LAST_Z_IMPROVE_START = 10
-    OBS_NEXT_NEG_VEL_MS_START = 15
-    OBS_LAST_NEG_VEL_MS_START = 20
+    # Future Observations (To be added):
+    # OBS_LAST_PULSE_GAP_Z_IMPROVE = 10
+    # OBS_PULSE_GAP_DURATION       = 11
+    # OBS_ACC_DROP_TO_OPEN_DELAY   = 12
 
     # Fixed observation normalization scales (divide raw obs by these)
     # Order: ee_pos_z, ee_vel_z, target_z_vel, target_z_acc,
     #        left_force_mag, right_force_mag,
-    #        cuboid_rel_z, cuboid_rel_x, cuboid_rel_y, desired_rel_z,
-    #        last_5_z_improvement,
-    #        last_5_time_to_next_neg_vel_ms,
-    #        last_5_time_to_last_neg_vel_ms
-    OBS_SCALE = (
-        [1.0, 0.6, 0.6, 15.0, 5.0, 5.0, 0.05, 0.05, 0.05, 0.05]
-        + [0.05] * HISTORY_LEN
-        + [200.0] * HISTORY_LEN
-        + [200.0] * HISTORY_LEN
-    )
+    #        cuboid_rel_z, cuboid_rel_x, cuboid_rel_y, desired_rel_z
+    #        (Future: last_pulse_gap_z_improve, pulse_gap_duration, acc_drop_to_open_delay)
+    OBS_SCALE = [1.0, 0.6, 0.6, 15.0, 5.0, 5.0, 0.05, 0.05, 0.05, 0.05]
 
     # Action scaling constants
     Z_VEL_MAX       = 0.6
@@ -410,15 +405,6 @@ class FrankaEnvParallel:
             self._post_pulse_hold_total = _hold_hl_steps
             self._post_pulse_delay_countdown = torch.zeros(N, dtype=torch.long, device=self.device)
             self._post_pulse_hold_countdown = torch.zeros(N, dtype=torch.long, device=self.device)
-            # Observation histories (oldest -> newest)
-            self._z_improve_hist = torch.zeros(N, self.HISTORY_LEN, device=self.device)
-            self._pulse_to_next_neg_vel_ms_hist = torch.zeros(N, self.HISTORY_LEN, device=self.device)
-            self._pulse_to_last_neg_vel_ms_hist = torch.zeros(N, self.HISTORY_LEN, device=self.device)
-            # Per-pulse transient state for timing extraction
-            self._pulse_open_start_ms = torch.zeros(N, device=self.device)
-            self._pulse_open_active = torch.zeros(N, dtype=torch.bool, device=self.device)
-            self._current_pulse_next_neg_ms = torch.full((N,), -1.0, device=self.device)
-            self._current_pulse_last_neg_ms = torch.full((N,), -1.0, device=self.device)
             # Cubic-hermite segment state per env
             self._seg_start = None   # (N, 3): (z, z_vel, z_acc)
             self._seg_end = None     # (N, 3)
@@ -482,13 +468,6 @@ class FrankaEnvParallel:
         self._prev_policy_z_vel_sign[envs_idx] = 0
         self._post_pulse_delay_countdown[envs_idx] = 0
         self._post_pulse_hold_countdown[envs_idx] = 0
-        self._z_improve_hist[envs_idx] = 0.0
-        self._pulse_to_next_neg_vel_ms_hist[envs_idx] = 0.0
-        self._pulse_to_last_neg_vel_ms_hist[envs_idx] = 0.0
-        self._pulse_open_start_ms[envs_idx] = 0.0
-        self._pulse_open_active[envs_idx] = False
-        self._current_pulse_next_neg_ms[envs_idx] = -1.0
-        self._current_pulse_last_neg_ms[envs_idx] = -1.0
 
         self._seg_start = None
         self._seg_end = None
@@ -609,24 +588,6 @@ class FrankaEnvParallel:
             self._gripper_pulse_steps <= self._gripper_pulse_lengths
         )
         _in_close = self._gripper_pulse_steps == 1
-        _step_start_ms = self.sim_step * self.dt * 1000.0
-        _open_start = _in_open & (~self._pulse_open_active)
-        self._pulse_open_start_ms = torch.where(
-            _open_start,
-            torch.full_like(self._pulse_open_start_ms, _step_start_ms),
-            self._pulse_open_start_ms,
-        )
-        self._current_pulse_next_neg_ms = torch.where(
-            _open_start,
-            torch.full_like(self._current_pulse_next_neg_ms, -1.0),
-            self._current_pulse_next_neg_ms,
-        )
-        self._current_pulse_last_neg_ms = torch.where(
-            _open_start,
-            torch.full_like(self._current_pulse_last_neg_ms, -1.0),
-            self._current_pulse_last_neg_ms,
-        )
-        self._pulse_open_active = _in_open
         gripper_pos = torch.where(
             _in_open.unsqueeze(-1), _gp_max_b,
             torch.where(_in_close.unsqueeze(-1), _gp_min_b, gripper_pos),
@@ -680,57 +641,6 @@ class FrankaEnvParallel:
                 refresh_visualizer=refresh_visualizer,
             )
 
-        ee_vel_z_step = self.ee_link.get_vel()[:, 2]
-        _step_end_ms = (self.sim_step + self.target_update_every) * self.dt * 1000.0
-        _elapsed_ms = (_step_end_ms - self._pulse_open_start_ms).clamp(min=0.0)
-        _neg_vel_now = ee_vel_z_step < 0.0
-        _next_neg_mask = _in_open & _neg_vel_now & (self._current_pulse_next_neg_ms < 0.0)
-        self._current_pulse_next_neg_ms = torch.where(
-            _next_neg_mask,
-            _elapsed_ms,
-            self._current_pulse_next_neg_ms,
-        )
-        _last_neg_mask = _in_open & _neg_vel_now
-        self._current_pulse_last_neg_ms = torch.where(
-            _last_neg_mask,
-            _elapsed_ms,
-            self._current_pulse_last_neg_ms,
-        )
-
-        if torch.any(_pulse_just_completed):
-            _next_ms = torch.where(
-                self._current_pulse_next_neg_ms >= 0.0,
-                self._current_pulse_next_neg_ms,
-                torch.zeros_like(self._current_pulse_next_neg_ms),
-            )
-            _last_ms = torch.where(
-                self._current_pulse_last_neg_ms >= 0.0,
-                self._current_pulse_last_neg_ms,
-                torch.zeros_like(self._current_pulse_last_neg_ms),
-            )
-            self._push_history(self._pulse_to_next_neg_vel_ms_hist, _next_ms, _pulse_just_completed)
-            self._push_history(self._pulse_to_last_neg_vel_ms_hist, _last_ms, _pulse_just_completed)
-            self._pulse_open_start_ms = torch.where(
-                _pulse_just_completed,
-                torch.zeros_like(self._pulse_open_start_ms),
-                self._pulse_open_start_ms,
-            )
-            self._pulse_open_active = torch.where(
-                _pulse_just_completed,
-                torch.zeros_like(self._pulse_open_active),
-                self._pulse_open_active,
-            )
-            self._current_pulse_next_neg_ms = torch.where(
-                _pulse_just_completed,
-                torch.full_like(self._current_pulse_next_neg_ms, -1.0),
-                self._current_pulse_next_neg_ms,
-            )
-            self._current_pulse_last_neg_ms = torch.where(
-                _pulse_just_completed,
-                torch.full_like(self._current_pulse_last_neg_ms, -1.0),
-                self._current_pulse_last_neg_ms,
-            )
-
         self.sim_step += self.target_update_every
         self.episode_length_buf += 1
         done, reward, timeout = self._compute_done_and_reward()
@@ -779,10 +689,11 @@ class FrankaEnvParallel:
             (cuboid_pos[:, 0] - finger_mid[:, 0]).unsqueeze(-1) + _unoise((_N, 1)), # [7]    cuboid_rel_x
             (cuboid_pos[:, 1] - finger_mid[:, 1]).unsqueeze(-1) + _unoise((_N, 1)), # [8]    cuboid_rel_y
             self.desired_rel_z.unsqueeze(-1),                                        # [9]    desired_rel_z
-            self._z_improve_hist,                                                    # [10:15]
-            self._pulse_to_next_neg_vel_ms_hist,                                    # [15:20]
-            self._pulse_to_last_neg_vel_ms_hist,                                    # [20:25]
-        ], dim=-1)  # (N, 25)
+            # TODO: Future observations to be appended here:
+            # [10] last_pulse_gap_z_improve: LAST PULSE GAP z improvement
+            # [11] pulse_gap_duration: duration of gap derived from finger pos
+            # [12] acc_drop_to_open_delay: delay (ms) from EE acceleration going below -10.0 to EE open (can be +/-)
+        ], dim=-1)  # (N, 10)
 
         if self.normalize:
             if not hasattr(self, '_obs_scale_t'):
@@ -903,7 +814,6 @@ class FrankaEnvParallel:
         z_err_before  = (self._release_cuboid_rel_z - self.desired_rel_z).abs()  # (N,)
         z_err_after   = (cuboid_rel_z               - self.desired_rel_z).abs()  # (N,)
         z_improvement = z_err_before - z_err_after                               # (N,) positive = closer
-        self._push_history(self._z_improve_hist, z_improvement, regrasp_event)
         raw_regrasp_bonus = (z_improvement.clamp(min=-0.05) * 15000.0).clamp(max=250.0)
         raw_regrasp_bonus = torch.where(
             raw_regrasp_bonus < 0.0,
@@ -927,7 +837,7 @@ class FrankaEnvParallel:
             torch.where(
                 fail | timeout,
                 torch.full_like(ee_z, -250.0),
-                torch.full_like(ee_z, -0.75),             # alive penalty: urgency to finish
+                torch.full_like(ee_z, -0.25),             # alive penalty: urgency to finish
             ),
         )
 
@@ -1027,13 +937,6 @@ class FrankaEnvParallel:
         self._prev_policy_z_vel_sign[envs_idx] = 0
         self._post_pulse_delay_countdown[envs_idx] = 0
         self._post_pulse_hold_countdown[envs_idx] = 0
-        self._z_improve_hist[envs_idx] = 0.0
-        self._pulse_to_next_neg_vel_ms_hist[envs_idx] = 0.0
-        self._pulse_to_last_neg_vel_ms_hist[envs_idx] = 0.0
-        self._pulse_open_start_ms[envs_idx] = 0.0
-        self._pulse_open_active[envs_idx] = False
-        self._current_pulse_next_neg_ms[envs_idx] = -1.0
-        self._current_pulse_last_neg_ms[envs_idx] = -1.0
         self._randomize_friction(envs_idx)
 
         # ---- initial velocity randomization (domain randomization) ----
@@ -1233,14 +1136,6 @@ class FrankaEnvParallel:
     # ------------------------------------------------------------------ #
     # Internal: utilities                                                 #
     # ------------------------------------------------------------------ #
-
-    def _push_history(self, hist: torch.Tensor, values: torch.Tensor, mask: torch.Tensor):
-        """Push scalar values into per-env fixed-length histories (oldest -> newest)."""
-        idx = mask.nonzero(as_tuple=False).squeeze(-1)
-        if idx.numel() == 0:
-            return
-        hist[idx, :-1] = hist[idx, 1:].clone()
-        hist[idx, -1] = values[idx]
 
     def _fingertip_pos(self, finger_link) -> torch.Tensor:
         """Compute fingertip world position (N, 3) from link pose."""

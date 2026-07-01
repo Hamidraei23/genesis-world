@@ -112,6 +112,8 @@ def main():
                         help="Enable domain randomization: obs noise and initial joint velocity perturbation")
     parser.add_argument("--normalization", action="store_true",
                         help="Enable fixed observation normalization (scales each obs channel to ~[-1, 1])")
+    parser.add_argument("--zero", action="store_true",
+                        help="Enable post-pulse zero-z-velocity + close-gripper hold inside the environment")
     args = parser.parse_args()
 
     log_dir = f"logs/{args.exp_name}"
@@ -144,6 +146,7 @@ def main():
         mix=args.mix,
         randomize=args.randomize,
         normalize=args.normalization,
+        zero=args.zero,
     )
 
     runner = OnPolicyRunner(env, train_cfg, log_dir, device=gs.device)

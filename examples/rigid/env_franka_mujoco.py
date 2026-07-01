@@ -38,7 +38,9 @@ class FrankaMuJoCoEnv:
     Z_ACC_MAX = 15.00
     Z_ACC_PENALTY_THRESHOLD = 13.0
     Z_ACC_PENALTY_WEIGHT = 0.0
-    PULSE_DELAY_STEPS = 1   # target-period steps to wait before the open window begins
+    PULSE_DELAY_STEPS = 3   # target-period steps to wait before the open window begins
+    ZERO_HOLD_DURATION_MIN = 0.1  # seconds
+    ZERO_HOLD_DURATION_MAX = 0.3  # seconds; used when randomize=True
     EE_Z_TARGET = 0.7
     GRIPPER_CLOSED = 0.000251
     GRIPPER_OPEN = 0.0124
@@ -82,6 +84,7 @@ class FrankaMuJoCoEnv:
         randomize: bool = False,
         normalize: bool = False,
         limit_regrasp: bool = False,
+        zero: bool = False,
     ):
         if playback_speed <= 0.0:
             raise ValueError("playback_speed must be greater than 0")
@@ -103,6 +106,7 @@ class FrankaMuJoCoEnv:
         self.randomize = randomize
         self.normalize = normalize
         self.limit_regrasp = limit_regrasp
+        self.zero = zero
 
         self.gripper_pos_min = np.broadcast_to(np.asarray(gripper_pos_min, dtype=float), (2,)).copy()
         self.gripper_pos_max = np.broadcast_to(np.asarray(gripper_pos_max, dtype=float), (2,)).copy()
@@ -208,6 +212,11 @@ class FrankaMuJoCoEnv:
         self._release_cuboid_rel_z = 0.0
         self._prev_gripper_avg = -1.0
         self._gripper_pulse_steps = 0
+        self._zero_hold_steps = max(1, int(round(self.ZERO_HOLD_DURATION_MIN / self.target_period)))
+        self._zero_hold_countdown = 0
+        self._zero_wait_for_direction_change = False
+        self._prev_policy_z_vel_sign = 0
+        self._sample_zero_hold_steps()
         self._randomize_friction()
         self._randomize_finger_gains()
 
@@ -229,6 +238,35 @@ class FrankaMuJoCoEnv:
         action = np.asarray(action, dtype=float).reshape(-1)
         if action.shape != (self.action_dim,):
             raise ValueError(f"action must have shape ({self.action_dim},), got {action.shape}")
+
+        if self.zero:
+            policy_z_vel = float(np.clip(action[0], -1.0, 1.0)) * self.z_vel_max
+            if policy_z_vel > 1e-4:
+                policy_z_vel_sign = 1
+            elif policy_z_vel < -1e-4:
+                policy_z_vel_sign = -1
+            else:
+                policy_z_vel_sign = 0
+
+            start_zero_hold = (
+                self._zero_wait_for_direction_change
+                and self._zero_hold_countdown == 0
+                and self._prev_policy_z_vel_sign != 0
+                and policy_z_vel_sign != 0
+                and policy_z_vel_sign != self._prev_policy_z_vel_sign
+            )
+            if start_zero_hold:
+                self._zero_hold_countdown = self._zero_hold_steps
+                self._zero_wait_for_direction_change = False
+
+            if policy_z_vel_sign != 0:
+                self._prev_policy_z_vel_sign = policy_z_vel_sign
+
+            if self._zero_hold_countdown > 0:
+                action = action.copy()
+                action[0] = 0.0
+                action[1:] = -1.0
+                self._zero_hold_countdown -= 1
 
         target_z_vel = float(np.clip(action[0], -1.0, 1.0)) * self.z_vel_max
         max_dv = self.Z_ACC_MAX * self.target_period
@@ -255,10 +293,15 @@ class FrankaMuJoCoEnv:
             gripper_pos = self.gripper_pos_max.copy()
         elif self._gripper_pulse_steps == 1:
             gripper_pos = self.gripper_pos_min.copy()
+
+        pulse_just_completed = self._gripper_pulse_steps == 1
             
         self._prev_gripper_avg = _gp_avg
         if self._gripper_pulse_steps > 0:
             self._gripper_pulse_steps -= 1
+
+        if self.zero and pulse_just_completed:
+            self._zero_wait_for_direction_change = True
         # ---------------------------
 
         target_z_acc = (target_z_vel - self.target_z_vel) / self.target_period
@@ -583,6 +626,20 @@ class FrankaMuJoCoEnv:
         self.model.actuator_biasprm[self.finger_actuators, 2] = -25.0
         self.model.actuator_forcerange[self.finger_actuators, 0] = -value
         self.model.actuator_forcerange[self.finger_actuators, 1] = value
+
+    def _sample_zero_hold_steps(self):
+        """Sample zero-hold duration in high-level steps.
+
+        Uses a fixed 0.1s hold unless randomization is enabled, where duration
+        is sampled uniformly in [0.1s, 0.3s].
+        """
+        if self.randomize:
+            duration_s = self.ZERO_HOLD_DURATION_MIN + np.random.uniform() * (
+                self.ZERO_HOLD_DURATION_MAX - self.ZERO_HOLD_DURATION_MIN
+            )
+            self._zero_hold_steps = max(1, int(round(duration_s / self.target_period)))
+        else:
+            self._zero_hold_steps = max(1, int(round(self.ZERO_HOLD_DURATION_MIN / self.target_period)))
 
     def _apply_arm_gravity_compensation(self):
         self.data.qfrc_applied[:] = 0.0

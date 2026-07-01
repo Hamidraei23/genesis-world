@@ -138,6 +138,7 @@ def main():
         solid_up=args.negative,
         normalize=args.normalization,
         randomize=args.randomize,
+        zero=args.zero,
     )
 
     # Wrap with ObservationHistoryWrapper so the LSTM model receives the
@@ -448,10 +449,6 @@ def main():
     _in_release = False
     _release_start = 0
     _force_thresh = raw_env.REGRASP_FORCE_THRESHOLD
-    post_pulse_hold_steps = max(1, int(round(0.5 / raw_env.target_period)))
-    post_pulse_hold_remaining = 0
-    wait_for_post_pulse_direction_change = False
-    prev_policy_z_vel_sign = 0
 
     print(
         f"target_dt={raw_env.target_period:.3f}s  sim_dt={raw_env.dt:.3f}s  "
@@ -486,36 +483,6 @@ def main():
                 prev_actual_z_vel = actual_z_vel_cur
 
                 actions = policy(obs_td)
-                pulse_steps_before = None
-                if args.zero:
-                    policy_z_vel = actions[0, 0].item() * raw_env.Z_VEL_MAX
-                    if policy_z_vel > 1e-4:
-                        policy_z_vel_sign = 1
-                    elif policy_z_vel < -1e-4:
-                        policy_z_vel_sign = -1
-                    else:
-                        policy_z_vel_sign = 0
-
-                    if (
-                        wait_for_post_pulse_direction_change
-                        and post_pulse_hold_remaining == 0
-                        and prev_policy_z_vel_sign != 0
-                        and policy_z_vel_sign != 0
-                        and policy_z_vel_sign != prev_policy_z_vel_sign
-                    ):
-                        post_pulse_hold_remaining = post_pulse_hold_steps
-                        wait_for_post_pulse_direction_change = False
-
-                    if policy_z_vel_sign != 0:
-                        prev_policy_z_vel_sign = policy_z_vel_sign
-
-                    if post_pulse_hold_remaining > 0:
-                        actions = actions.clone()
-                        actions[:, 0] = 0.0
-                        actions[:, 1:] = -1.0
-                        post_pulse_hold_remaining -= 1
-
-                    pulse_steps_before = raw_env._gripper_pulse_steps[0].item()
                 obs_td, rew_buf, reset_buf, _ = env.step(actions)
 
                 reward_cur = rew_buf[0].item()
@@ -565,12 +532,23 @@ def main():
                         release_spans.append((_release_start, ep_len))
                         _in_release = False
 
-                    success = ep_reward > 0
+                    terminal_success = _reward_term_float(raw_env.last_reward_terms.get("success"), 0.0) > 0.5
+                    terminal_fail = _reward_term_float(raw_env.last_reward_terms.get("fail"), 0.0) > 0.5
+                    terminal_timeout = _reward_term_float(raw_env.last_reward_terms.get("timeout"), 0.0) > 0.5
+                    if terminal_success:
+                        terminal_status = "SUCCESS"
+                    elif terminal_timeout:
+                        terminal_status = "TIMEOUT"
+                    elif terminal_fail:
+                        terminal_status = "FAIL"
+                    else:
+                        terminal_status = "DONE"
+
                     ep_count += 1
                     print(
                         f"  [EP {ep_count}] len={ep_len}  reward={ep_reward:.1f}  "
                         f"regrasps={len(release_spans)}  "
-                        f"{'SUCCESS' if success else 'fail'}"
+                        f"{terminal_status}"
                     )
 
                     if args.plot and bufs["steps"]:
@@ -585,12 +563,6 @@ def main():
                     ep_len = 0
                     prev_actual_z_vel = None
                     prev_print_z_vel  = None
-                    post_pulse_hold_remaining = 0
-                    wait_for_post_pulse_direction_change = False
-                    prev_policy_z_vel_sign = 0
-
-                elif args.zero and pulse_steps_before == 1:
-                    wait_for_post_pulse_direction_change = True
 
                 if (not reset_buf[0].item()) and i % 100 == 0:
                     actual_z      = sample["actual_z"]
