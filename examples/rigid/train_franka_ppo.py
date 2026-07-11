@@ -114,6 +114,8 @@ def main():
                         help="Enable fixed observation normalization (scales each obs channel to ~[-1, 1])")
     parser.add_argument("--zero", action="store_true",
                         help="Enable post-pulse zero-z-velocity + close-gripper hold inside the environment")
+    parser.add_argument("--control-error", action="store_true",
+                        help="Add per-episode constant z-velocity command bias sampled in [-0.05, -0.03] U [0.03, 0.05]")
     args = parser.parse_args()
 
     log_dir = f"logs/{args.exp_name}"
@@ -147,6 +149,7 @@ def main():
         randomize=args.randomize,
         normalize=args.normalization,
         zero=args.zero,
+        control_error=args.control_error,
     )
 
     runner = OnPolicyRunner(env, train_cfg, log_dir, device=gs.device)

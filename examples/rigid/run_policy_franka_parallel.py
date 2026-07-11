@@ -80,6 +80,8 @@ def main():
                         help="Enable domain randomization (must match training setting)")
     parser.add_argument("--zero", action="store_true", default=False,
                         help="After a gripper pulse, temporarily zero z velocity and close the gripper")
+    parser.add_argument("--control-error", action="store_true", default=False,
+                        help="Add per-episode constant z-velocity command bias in [-0.05, -0.03] U [0.03, 0.05]")
     args = parser.parse_args()
 
     if args.record:
@@ -120,6 +122,7 @@ def main():
         solid_up=args.negative,
         normalize=args.normalization,
         randomize=args.randomize,
+        control_error=args.control_error,
     )
 
     # ---- load policy ------------------------------------------------------
@@ -185,7 +188,7 @@ def main():
     def _fresh_buffers():
         d = dict(
             steps=[], ee_z=[], cuboid_rel_z=[], desired_rel_z=[],
-            ft_dist=[], lf_mag=[], rf_mag=[], reward=[],
+            ft_dist=[], avg_force=[], reward=[],
             # motion detail
             target_z=[], actual_z_vel=[], target_z_vel=[],
             target_z_acc=[], actual_z_acc=[], z_error=[],
@@ -201,14 +204,13 @@ def main():
                        label="release window" if idx == 0 else "")
 
     def _plot_episode(bufs, release_spans, ep_idx, save_dir):
-        """Plot 1 – overview: cuboid Z, EE Z, fingertip dist, forces, reward."""
+        """Plot 1 – overview: cuboid Z, EE Z, fingertip dist, average force, reward."""
         steps      = np.asarray(bufs["steps"])
         ee_z       = np.asarray(bufs["ee_z"])
         cub_rel_z  = np.asarray(bufs["cuboid_rel_z"])
         des_rel_z  = np.asarray(bufs["desired_rel_z"])
         ft_dist    = np.asarray(bufs["ft_dist"])
-        lf_mag     = np.asarray(bufs["lf_mag"])
-        rf_mag     = np.asarray(bufs["rf_mag"])
+        avg_force  = np.asarray(bufs["avg_force"])
         reward     = np.asarray(bufs["reward"])
         cum_reward = np.cumsum(reward)
 
@@ -222,8 +224,8 @@ def main():
              "EE height [m]", "End-effector Z"),
             (axes[2], [(ft_dist, "fingertip_dist", "C2")],
              "Distance [m]", "Fingertip distance"),
-            (axes[3], [(lf_mag, "|left_force|", "C4"), (rf_mag, "|right_force|", "C5")],
-             "Force [N]", "Finger contact forces"),
+            (axes[3], [(avg_force, "avg_force", "C4")],
+             "Force [N]", "Average finger contact force"),
             (axes[4], [(reward, "reward/step", "C6"), (cum_reward, "cumulative", "C7")],
              "Reward", "Reward"),
         ]
@@ -364,8 +366,7 @@ def main():
         The env resets internally before returning observations on a terminal step, so callers pass the
         pre-step observation here and attach the reward produced by that step.
         """
-        lf_mag  = obs[0, FrankaEnvParallel.OBS_LEFT_FORCE_MAG].item()
-        rf_mag  = obs[0, FrankaEnvParallel.OBS_RIGHT_FORCE_MAG].item()
+        avg_force = _reward_term_float(reward_terms.get("avg_force"))
 
         actual_z_vel = obs[0, FrankaEnvParallel.OBS_EE_VEL_Z].item()
         cub_rel_z    = obs[0, FrankaEnvParallel.OBS_CUBOID_REL_Z].item()
@@ -379,8 +380,7 @@ def main():
         bufs["cuboid_rel_z"].append(cub_rel_z)
         bufs["desired_rel_z"].append(des_rel_z)
         bufs["ft_dist"].append(ft_dist)
-        bufs["lf_mag"].append(lf_mag)
-        bufs["rf_mag"].append(rf_mag)
+        bufs["avg_force"].append(avg_force)
         bufs["reward"].append(reward_value)
         # motion detail
         bufs["target_z"].append(target_z)
@@ -397,12 +397,10 @@ def main():
         return {
             "actual_z": bufs["ee_z"][-1],
             "actual_z_vel": actual_z_vel,
-            "avg_force": (lf_mag + rf_mag) * 0.5,
+            "avg_force": avg_force,
             "cuboid_rel_z": cub_rel_z,
             "desired_rel_z": des_rel_z,
             "ft_dist": ft_dist,
-            "lf_mag": lf_mag,
-            "rf_mag": rf_mag,
         }
 
     # ---- run loop ---------------------------------------------------------
@@ -501,12 +499,10 @@ def main():
                     f"ee_vel_z={_o[1]:+.4f}  "
                     f"target_z_vel={_o[2]:+.4f}  "
                     f"target_z_acc={_o[3]:+.4f}  "
-                    f"left_force_mag={_o[4]:+.3f}  "
-                    f"right_force_mag={_o[5]:+.3f}  "
-                    f"cuboid_rel_z={_o[6]:+.4f}  "
-                    f"cuboid_rel_x={_o[7]:+.4f}  "
-                    f"cuboid_rel_y={_o[8]:+.4f}  "
-                    f"desired_rel_z={_o[9]:+.4f}"
+                    f"cuboid_rel_z={_o[FrankaEnvParallel.OBS_CUBOID_REL_Z]:+.4f}  "
+                    f"cuboid_rel_x={_o[FrankaEnvParallel.OBS_CUBOID_REL_X]:+.4f}  "
+                    f"cuboid_rel_y={_o[FrankaEnvParallel.OBS_CUBOID_REL_Y]:+.4f}  "
+                    f"desired_rel_z={_o[FrankaEnvParallel.OBS_DESIRED_REL_Z]:+.4f}"
                 )
                 ep_reward += reward_cur
                 ep_len += 1
@@ -585,7 +581,7 @@ def main():
                     print(
                         f"step {env.sim_step:6d}  z={actual_z:.4f}  z_vel={actual_z_vel_cur:+.3f}  "
                         f"z_acc={z_acc:+.2f}  ft_dist={ft_dist:.4f}  "
-                        f"|lf|={sample['lf_mag']:.3f}  |rf|={sample['rf_mag']:.3f}  "
+                        f"avg_force={sample['avg_force']:.3f}  "
                         f"cuboid_rel_z={cuboid_rel_z:+.4f}  desired={desired_rel_z:+.4f}  "
                         f"err={abs(cuboid_rel_z - desired_rel_z)*1000:.2f}mm  "
                         f"ep_rew={ep_reward:.1f}  z_vel={actual_z_vel_cur:+.3f}"

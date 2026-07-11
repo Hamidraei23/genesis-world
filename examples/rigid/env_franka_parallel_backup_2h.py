@@ -65,18 +65,20 @@ class FrankaEnvParallel:
     """
     Vectorised Franka environment.
 
-    Observations: flat tensor (N, OBS_DIM=14)
+    Observations: flat tensor (N, OBS_DIM=25)
         [0]    ee_pos_z
         [1]    ee_vel_z
         [2]    target_z_vel
         [3]    target_z_acc
-        [4]    cuboid_rel_z
-        [5]    cuboid_rel_x
-        [6]    cuboid_rel_y
-        [7]    desired_rel_z
-        [8:10]   last 2 z_improvement values (oldest → newest)
-        [10:12]  last 2 time-to-next(ee_vel_z < 0) after pulse-open, in ms (oldest → newest)
-        [12:14]  last 2 time-to-last(ee_vel_z < 0) after pulse-open, in ms (oldest → newest)
+        [4]    left_force_mag   (scalar)
+        [5]    right_force_mag  (scalar)
+        [6]    cuboid_rel_z
+        [7]    cuboid_rel_x
+        [8]    cuboid_rel_y
+        [9]    desired_rel_z
+        [10:15]  last 5 z_improvement values (oldest → newest)
+        [15:20]  last 5 time-to-next(ee_vel_z < 0) after pulse-open, in ms (oldest → newest)
+        [20:25]  last 5 time-to-last(ee_vel_z < 0) after pulse-open, in ms (oldest → newest)
 
     Actions (per env, shape (N, action_dim=3)):
         [0]   target_z_vel
@@ -84,28 +86,31 @@ class FrankaEnvParallel:
     """
 
     # Observation layout constants
-    OBS_DIM            = 14
+    OBS_DIM            = 16
     HISTORY_LEN        = 2
     OBS_EE_POS_Z       = 0
     OBS_EE_VEL_Z       = 1
     OBS_TARGET_Z_VEL   = 2
     OBS_TARGET_Z_ACC   = 3
-    OBS_CUBOID_REL_Z   = 4
-    OBS_CUBOID_REL_X   = 5
-    OBS_CUBOID_REL_Y   = 6
-    OBS_DESIRED_REL_Z  = 7
-    OBS_LAST_Z_IMPROVE_START = 8
-    OBS_NEXT_NEG_VEL_MS_START = 10
-    OBS_LAST_NEG_VEL_MS_START = 12
+    OBS_LEFT_FORCE_MAG = 4
+    OBS_RIGHT_FORCE_MAG = 5
+    OBS_CUBOID_REL_Z   = 6
+    OBS_CUBOID_REL_X   = 7
+    OBS_CUBOID_REL_Y   = 8
+    OBS_DESIRED_REL_Z  = 9
+    OBS_LAST_Z_IMPROVE_START = 10
+    OBS_NEXT_NEG_VEL_MS_START = 15
+    OBS_LAST_NEG_VEL_MS_START = 20
 
     # Fixed observation normalization scales (divide raw obs by these)
     # Order: ee_pos_z, ee_vel_z, target_z_vel, target_z_acc,
+    #        left_force_mag, right_force_mag,
     #        cuboid_rel_z, cuboid_rel_x, cuboid_rel_y, desired_rel_z,
-    #        z_improvement history,
-    #        time_to_next_neg_vel_ms history,
-    #        time_to_last_neg_vel_ms history
+    #        last_5_z_improvement,
+    #        last_5_time_to_next_neg_vel_ms,
+    #        last_5_time_to_last_neg_vel_ms
     OBS_SCALE = (
-        [1.0, 0.6, 0.6, 15.0, 0.05, 0.05, 0.05, 0.05]
+        [1.0, 0.6, 0.6, 15.0, 5.0, 5.0, 0.05, 0.05, 0.05, 0.05]
         + [0.05] * HISTORY_LEN
         + [200.0] * HISTORY_LEN
         + [200.0] * HISTORY_LEN
@@ -135,11 +140,11 @@ class FrankaEnvParallel:
     EE_HOLD_VEL_TOLERANCE = 0.02
     EE_HOLD_REQUIRED_STEPS = 5
     EE_HOLD_ACC_THRESHOLD = 2.0
-    PULSE_DELAY_STEPS = 2   # target-period steps to wait before the open window begins
+    PULSE_DELAY_STEPS = 4   # target-period steps to wait before the open window begins
     PULSE_DELAY_RANDOM_MIN = 0
-    PULSE_DELAY_RANDOM_MAX = 3
-    PULSE_LENGTH = 5   # steps: 5 open, 1 close, then back to policy control
-    PULSE_LENGTH_RANDOM_MIN = 4
+    PULSE_DELAY_RANDOM_MAX = 4
+    PULSE_LENGTH = 4   # steps: 5 open, 1 close, then back to policy control
+    PULSE_LENGTH_RANDOM_MIN = 3
     PULSE_LENGTH_RANDOM_MAX = 6
     ZERO_HOLD_DURATION_MIN = 0.1  # seconds
     ZERO_HOLD_DURATION_MAX = 0.3  # seconds; used when randomize=True
@@ -763,6 +768,12 @@ class FrankaEnvParallel:
         left_ft = self._fingertip_pos(self.left_finger)    # (N, 3)
         right_ft = self._fingertip_pos(self.right_finger)  # (N, 3)
 
+        link_forces = self.franka.get_links_net_contact_force()  # (N, n_links, 3)
+        left_force = link_forces[:, self.left_finger.idx_local, :]   # (N, 3)
+        right_force = link_forces[:, self.right_finger.idx_local, :]  # (N, 3)
+        left_force_mag = left_force.norm(dim=-1, keepdim=True)    # (N, 1)
+        right_force_mag = right_force.norm(dim=-1, keepdim=True)  # (N, 1)
+
         finger_mid = (left_ft + right_ft) / 2.0  # (N, 3)
         _noise_range = 0.003 if self.randomize else 0.0
         _N = self.num_envs
@@ -775,14 +786,16 @@ class FrankaEnvParallel:
             ee_vel[:, 2:3]  + _unoise((_N, 1)),                                     # [1]    ee_vel_z
             self.target_z_vel.unsqueeze(-1),                                         # [2]    target_z_vel
             self.target_z_acc.unsqueeze(-1),                                         # [3]    target_z_acc
-            (cuboid_pos[:, 2] - finger_mid[:, 2]).unsqueeze(-1) + _unoise((_N, 1)), # [4]    cuboid_rel_z
-            (cuboid_pos[:, 0] - finger_mid[:, 0]).unsqueeze(-1) + _unoise((_N, 1)), # [5]    cuboid_rel_x
-            (cuboid_pos[:, 1] - finger_mid[:, 1]).unsqueeze(-1) + _unoise((_N, 1)), # [6]    cuboid_rel_y
-            self.desired_rel_z.unsqueeze(-1),                                        # [7]    desired_rel_z
-            self._z_improve_hist,                                                    # [8:10]
-            self._pulse_to_next_neg_vel_ms_hist,                                    # [10:12]
-            self._pulse_to_last_neg_vel_ms_hist,                                    # [12:14]
-        ], dim=-1)  # (N, 14)
+            left_force_mag,                                                          # [4]    left_force_mag
+            right_force_mag,                                                         # [5]    right_force_mag
+            (cuboid_pos[:, 2] - finger_mid[:, 2]).unsqueeze(-1) + _unoise((_N, 1)), # [6]    cuboid_rel_z
+            (cuboid_pos[:, 0] - finger_mid[:, 0]).unsqueeze(-1) + _unoise((_N, 1)), # [7]    cuboid_rel_x
+            (cuboid_pos[:, 1] - finger_mid[:, 1]).unsqueeze(-1) + _unoise((_N, 1)), # [8]    cuboid_rel_y
+            self.desired_rel_z.unsqueeze(-1),                                        # [9]    desired_rel_z
+            self._z_improve_hist,                                                    # [10:15]
+            self._pulse_to_next_neg_vel_ms_hist,                                    # [15:20]
+            self._pulse_to_last_neg_vel_ms_hist,                                    # [20:25]
+        ], dim=-1)  # (N, 25)
 
         if self.normalize:
             if not hasattr(self, '_obs_scale_t'):
@@ -924,11 +937,11 @@ class FrankaEnvParallel:
         ep = self.episode_length_buf.float()
         base_reward = torch.where(
             success,
-            1000.0 - ep * 0.5,                          # up to 1000; small time penalty
+            3000.0 - ep * 0.5,                          # up to 1000; small time penalty
             torch.where(
                 fail | timeout,
                 torch.full_like(ee_z, -250.0),
-                torch.full_like(ee_z, -0.25),             # alive penalty: urgency to finish
+                torch.full_like(ee_z, -1.25),             # alive penalty: urgency to finish
             ),
         )
 
@@ -955,7 +968,7 @@ class FrankaEnvParallel:
         )
         self._post_pulse_delay_countdown = (self._post_pulse_delay_countdown - 1).clamp(min=0)
 
-        reward = base_reward + regrasp_bonus*2.0 + jerk_penalty + post_pulse_hold_penalty
+        reward = base_reward + regrasp_bonus*2 + jerk_penalty + post_pulse_hold_penalty
 
         self.last_reward_terms = {
             "base_reward":   base_reward.detach().clone(),
