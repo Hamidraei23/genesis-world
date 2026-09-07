@@ -2,36 +2,10 @@
 
 How to reproduce, on hardware, the exact motion recorded in
 `logs/franka-lift-v1-student-ft3/traj_vis/` by
-[eval_pulse_grid_traj_franka.py](examples/rigid/eval_pulse_grid_traj_franka.py).
+[eval_pulse_grid_traj_franka.py](eval_pulse_grid_traj_franka.py).
 
 Watch `traj_d2_l4.mp4` before reading further — the motion is not what "2 cm lift"
 sounds like, and everything below depends on understanding what it actually is.
-
-## Watch it first
-<video src="logs/franka-lift-v1-student-ft3/traj_vis/traj_d2_l4.mp4" controls muted loop width="720"></video>
-
-`traj_d2_l4.mp4` — pulse delay 2 (40 ms), pulse length 4 (80 ms), 3 pulses, 1.10 s.
-
-All twelve:
-
-<table><tr>
-<td><video src="logs/franka-lift-v1-student-ft3/traj_vis/traj_d1_l3.mp4" controls muted loop width="320"></video><br><sub>d1_l3</sub></td>
-<td><video src="logs/franka-lift-v1-student-ft3/traj_vis/traj_d1_l4.mp4" controls muted loop width="320"></video><br><sub>d1_l4</sub></td>
-<td><video src="logs/franka-lift-v1-student-ft3/traj_vis/traj_d1_l5.mp4" controls muted loop width="320"></video><br><sub>d1_l5</sub></td>
-<td><video src="logs/franka-lift-v1-student-ft3/traj_vis/traj_d1_l6.mp4" controls muted loop width="320"></video><br><sub>d1_l6</sub></td>
-</tr><tr>
-<td><video src="logs/franka-lift-v1-student-ft3/traj_vis/traj_d2_l3.mp4" controls muted loop width="320"></video><br><sub>d2_l3</sub></td>
-<td><video src="logs/franka-lift-v1-student-ft3/traj_vis/traj_d2_l4.mp4" controls muted loop width="320"></video><br><sub>d2_l4</sub></td>
-<td><video src="logs/franka-lift-v1-student-ft3/traj_vis/traj_d2_l5.mp4" controls muted loop width="320"></video><br><sub>d2_l5</sub></td>
-<td><video src="logs/franka-lift-v1-student-ft3/traj_vis/traj_d2_l6.mp4" controls muted loop width="320"></video><br><sub>d2_l6</sub></td>
-</tr><tr>
-<td><video src="logs/franka-lift-v1-student-ft3/traj_vis/traj_d3_l3.mp4" controls muted loop width="320"></video><br><sub>d3_l3</sub></td>
-<td><video src="logs/franka-lift-v1-student-ft3/traj_vis/traj_d3_l4.mp4" controls muted loop width="320"></video><br><sub>d3_l4</sub></td>
-<td><video src="logs/franka-lift-v1-student-ft3/traj_vis/traj_d3_l5.mp4" controls muted loop width="320"></video><br><sub>d3_l5</sub></td>
-<td><video src="logs/franka-lift-v1-student-ft3/traj_vis/traj_d3_l6.mp4" controls muted loop width="320"></video><br><sub>d3_l6</sub></td>
-</tr></table>
-
-> GitHub does not play `<video>` from a repo path; open the files locally (`logs/franka-lift-v1-student-ft3/traj_vis/`) or in the VS Code markdown preview.
 
 ---
 
@@ -59,7 +33,7 @@ distilled from the 2H teacher.
 Every episode ended in the env's success condition at a pinned target of
 **+0.02 m**, i.e. `|cuboid_rel_z − 0.02| ≤ 0.005` with a firm grasp held ≥ 3
 steps, `|ee_vel_z| < 0.02`, and `0.7 ≤ ee_z ≤ 0.86`
-([env_franka_parallel.py:847-854](examples/rigid/env_franka_parallel.py#L847-L854)).
+([env_franka_parallel.py:847-854](env_franka_parallel.py#L847-L854)).
 
 | file | steps | duration | pulses | net EE Δz | final `cuboid_rel_z` |
 |---|---|---|---|---|---|
@@ -96,7 +70,7 @@ episode moves the hand down 38 mm to gain 22 mm of grasp-point shift.
 
 The gripper never opens geometrically. Per-finger command range is
 `gripper_pos_min = 0.000251 m` to `gripper_pos_max = 0.0124 m`
-([env_franka_parallel.py:171-172](examples/rigid/env_franka_parallel.py#L171-L172)), so even
+([env_franka_parallel.py:171-172](env_franka_parallel.py#L171-L172)), so even
 fully "open" the finger pair spans 24.8 mm against a 25 mm bar. **The pulse is a
 grip-force pulse, not an open/close motion** — see §6.
 
@@ -144,7 +118,7 @@ Treat waypoint `i` as due at `(i + 1) × 0.02 s`.
 
 **Recovering the initial waypoint.** The env integrates the reference with a
 trapezoid, `z[i] = z[i−1] + 0.5·(v[i−1] + v[i])·T`
-([env_franka_parallel.py:665](examples/rigid/env_franka_parallel.py#L665)), so the reference
+([env_franka_parallel.py:665](env_franka_parallel.py#L665)), so the reference
 point at `t = 0` (which is not a row) is exactly
 
 ```
@@ -156,104 +130,95 @@ and you have the complete waypoint list.
 
 ---
 
-## 4. What you send, given the controller you already have
+## 4. The control stack you must reproduce
 
-This section assumes what you have on the robot today: **the same controller as
-the sim** (cubic-Hermite expansion of the 50 Hz reference to 1 kHz, the 2nd-order
-velocity low-pass, the DLS velocity IK), commanded with a **target z velocity**.
-Under that assumption the replay is a column playback, and the only real work is
-§4.3 and §5.
+The CSV is a **50 Hz reference**, not a joint trajectory. In sim it is expanded
+to 1 kHz by the following chain — reproduce it, or your hardware will track a
+different signal:
 
-### 4.1 The command stream
+1. **Cubic-Hermite interpolation** between consecutive waypoints, 20 ms apart,
+   matching both position and velocity at each end
+   ([env_franka_parallel.py:1222-1254](env_franka_parallel.py#L1222-L1254)):
 
-Play the **`target_z_vel`** column, one row every 20 ms, in file order. That
-column is exactly the signal the sim's controller received: it already contains
-the per-episode control-error bias and the ±15 m/s² acceleration clamp baked in.
+   ```
+   s  = (t − t_i) / T,   T = 0.02
+   z  = h00·z_i + h10·T·v_i + h01·z_{i+1} + h11·T·v_{i+1}
+   ż  = (dh00·z_i + dh10·T·v_i + dh01·z_{i+1} + dh11·T·v_{i+1}) / T
+   h00 = 2s³−3s²+1   h10 = s³−2s²+s   h01 = −2s³+3s²   h11 = s³−s²
+   ```
 
-- **Do not** use `act_z_vel` — that is the raw policy output *before* the bias,
-  and it is not what produced the motion in the video.
-- Row `i` is the reference at `(i + 1) × 0.02 s` (§3). `t = 0` is the instant the
-  arm is holding still at the start pose with the bar gripped.
+2. **2nd-order low-pass on the velocity reference only**, run at 1 kHz
+   ([env_franka_parallel.py:245-259](env_franka_parallel.py#L245-L259)).
+   The code comment there says `9025 / (s² + 100.8 s + 9025)` but the constants
+   actually used are `_wn2 = 160000`, `_blin = 490`, i.e.
 
-**Send `target_z` as well if your controller keeps the position-error term.** The
-sim commands `v_cmd = v_ref + 8.0 · (target_z − ee_z)`
-([env_franka_parallel.py:1197-1201](examples/rigid/env_franka_parallel.py#L1197-L1201)),
-so the velocity column alone is only half the loop. In these files the measured
-`ee_z` sits 2–4 mm below `target_z` for the whole episode; with the position term
-that error is held constant, without it the same error integrates and the hand
-walks away from the reference over 30–120 steps. Either:
+   ```
+   H(s) = 160000 / (s² + 490 s + 160000)      ωn = 400 rad/s (63.7 Hz), ζ = 0.61
+   ```
 
-- send both columns and keep `pos_gain = 8.0` — what the sim did, and the exact
-  match; or
-- send velocity only, and re-zero the position against `target_z` at each pulse
-  boundary so the drift cannot accumulate across cycles.
+   discretised by bilinear/Tustin transform at T = 1 ms. **Trust the constants,
+   not the comment.**
 
-### 4.2 One detail worth double-checking in your controller
+3. **Damped-least-squares velocity IK at 1 kHz**
+   ([env_franka_parallel.py:1159-1217](env_franka_parallel.py#L1159-L1217)),
+   with only z time-varying — x, y and orientation are held at the pose captured
+   at reset:
 
-The velocity low-pass is the one place the env's own comment is wrong. The
-constants in use give
+   ```
+   ee_vel_cmd = [ v_ref + 8.0·(p_target − p_ee) ,  4.0·rotvec(q_target ⊗ q_ee⁻¹) ]
+   q̇ = Jᵀ (J Jᵀ + 1e-4·I)⁻¹ ee_vel_cmd          # J = 6×7 arm Jacobian at link "hand"
+   ```
 
-```
-H(s) = 160000 / (s² + 490 s + 160000)      ωn = 400 rad/s (63.7 Hz), ζ = 0.61
-```
+   `pos_gain = 8.0`, `rot_gain = 4.0`, `jacobian_damping = 1e-4`.
 
-while the docstring three lines above them still reads
-`9025 / (s² + 100.8 s + 9025)` (ωn = 95 rad/s, ζ = 0.53)
-([env_franka_parallel.py:245-259](examples/rigid/env_franka_parallel.py#L245-L259)).
-If you built your filter from the comment, it is roughly 4× slower than the sim's
-and it will smear exactly the velocity reversal that the slip depends on. Trust
-the constants.
+4. **Joint velocity command** to the 7 arm DOFs. Sim gains
+   ([env_franka_parallel.py:1305-1323](env_franka_parallel.py#L1305-L1323)):
+   `kp = [4500, 4500, 3500, 3500, 2000, 2000, 2000]`,
+   `kv = [450, 450, 350, 350, 200, 200, 200]`,
+   torque limits `±[87, 87, 87, 87, 12, 12, 12]` N·m (the real Panda's limits).
 
-### 4.3 z velocity alone reproduces the motion, not the result
-
-The hand will move as in the video, and the bar will not move in the grasp. The
-2 cm comes from the grip force releasing and re-engaging on the same 20 ms grid
-as the velocity command — see §6. A velocity-only replay is a valid first test of
-the arm path; it is not a replay of the task.
+If your stack takes Cartesian pose or velocity targets directly (e.g.
+`franka_ros2` Cartesian velocity interface, or libfranka
+`callback_cartesian_velocity`), you can skip steps 3–4 and feed the filtered
+`ż` from steps 1–2 plus the position-error term — but keep the 8.0 position gain,
+it is what closes the z error inside each 20 ms segment.
 
 ---
 
-## 5. Procedure
+## 5. Replay recipe
 
-1. **Start pose.** Drive to
-   `q_home = [0.0, −0.82, 0.0, −2.180, 0.0, 2.9, 0.78] rad`
-   ([env_franka_parallel.py:316-319](examples/rigid/env_franka_parallel.py#L316-L319))
-   and let it settle (the sim holds it for 100 ms before `t = 0`). Freeze x, y and
-   orientation there — only z moves for the whole episode.
+1. **Match the start pose.** Home configuration
+   ([env_franka_parallel.py:316-319](env_franka_parallel.py#L316-L319)):
 
-2. **Grip the bar** vertically, near its middle, so that
-   `cuboid_rel_z = bar_centre_z − mean_fingertip_z ≈ 0`. That datum is what the
-   +0.02 m is measured against; if you start with the bar already high in the
-   grasp you are measuring from the wrong zero.
+   ```
+   q_home = [0.0, −0.82, 0.0, −2.180, 0.0, 2.9, 0.78]   rad
+   fingers = 0.00809 m each (16.18 mm width command — squeezing the 25 mm bar)
+   ```
 
-3. **Pick a file.** Start with `traj_d2_l4.csv` — 55 steps, 1.10 s, 3 pulses,
-   38 mm of hand travel, mid-pack on every count. Save the long ones
-   (`d1_l3`, 9 pulses) for later.
+   Let it settle (the sim holds `q_home` for 100 × 1 ms warmup steps before
+   `t = 0`), then freeze `p_target.xy` and `q_target` at the resulting hand pose.
 
-4. **Arm both streams off one clock.** The `target_z_vel` row and the
-   `grip_cmd_l/r` transition on the *same* row index must be issued in the same
-   20 ms slot. Any fixed lag between the two streams shifts the release relative
-   to the velocity reversal, which is the whole mechanism.
+2. **Place the bar.** In sim it is spawned at `hand_pos + R(hand_quat)·[0, 0,
+   0.1029]` with a fixed relative orientation
+   ([env_franka_parallel.py:1284-1303](env_franka_parallel.py#L1284-L1303)) —
+   i.e. its centre sits 102.9 mm along the hand approach axis, gripped near its
+   middle, long axis vertical. On hardware, grip the bar so that
+   `cuboid_rel_z ≈ 0` at `t = 0`; that datum is what the +0.02 m is measured
+   against.
 
-5. **Check your acceleration headroom first** (§9). The reference asks for up to
-   0.30 m/s of velocity change per 20 ms step; a Panda's 13 m/s² Cartesian limit
-   allows 0.26 m/s. Expect ~15% clipping on the sharpest steps unless you have
-   raised the limit, and know that the clipping lands on the reversal.
+3. **Convert to a relative z reference.** The `target_z` column is absolute in
+   the sim world frame. Use `Δz[i] = target_z[i] − z0` with `z0` from §3 and add
+   it to your measured starting hand z. Do **not** try to match the absolute
+   0.85 m — it is an artifact of the sim's base frame.
 
-6. **Stop at the last row.** The episode ends the step the success test passes;
-   there is no settle-out tail in the file.
+4. **Stream at 1 kHz** using §4 steps 1–2, one 20 ms segment per CSV row.
 
-7. **Measure and tune.** Log `cuboid_rel_z` per pulse, not just at the end. Then:
+5. **Drive the gripper from `grip_cmd_l/r`, as force** — see §6. The transition
+   edges are what matter; they are aligned to the same 20 ms grid as the z
+   reference and must not drift relative to it.
 
-   | symptom | likely cause | try |
-   |---|---|---|
-   | almost no slip | release force too high — the bar never goes free | lower the released-state force toward 0 N (sim's free threshold is 0.15 N avg) |
-   | slip much larger than 2 cm | release too long, or re-grip too late | move to a shorter `L` file, or tighten the re-grip edge to the exact row |
-   | slips then falls | re-grip force too low | raise the squeeze force within the 1–6 N band (§6) |
-   | slip varies run to run | expected | the file is one draw of μ ∈ [0.6, 0.9] and kp ∈ [100, 500] N/m (§7); average over runs |
-
-   Do not expect the first run to land on 2 cm. The arm motion reproduces
-   exactly; the displacement is a contact outcome and has to be tuned in.
+6. **Stop at the last row.** The episode terminates the step the success test
+   passes; there is no settle-out tail in the file.
 
 ---
 
@@ -261,8 +226,8 @@ the arm path; it is not a replay of the task.
 
 The finger DOFs are position-controlled with a **per-episode randomized
 stiffness** `kp ~ U[100, 500] N/m`, `kv = 25`, and force range clamped to `±kp`
-([env_franka_parallel.py:1140-1153](examples/rigid/env_franka_parallel.py#L1140-L1153),
-[:1325-1327](examples/rigid/env_franka_parallel.py#L1325-L1327)). Because the bar blocks the
+([env_franka_parallel.py:1140-1153](env_franka_parallel.py#L1140-L1153),
+[:1325-1327](env_franka_parallel.py#L1325-L1327)). Because the bar blocks the
 fingers at ≈ 0.0125 m each, the commanded position sets a *force*:
 
 | `grip_cmd` per finger | position error vs. the blocked finger | resulting squeeze |
@@ -272,7 +237,7 @@ fingers at ≈ 0.0125 m each, the commanded position sets a *force*:
 
 The env's own thresholds agree with that scale: below 0.15 N average finger force
 counts as fully released, at/above 0.75 N as a firm grasp
-([env_franka_parallel.py:123-124](examples/rigid/env_franka_parallel.py#L123-L124)).
+([env_franka_parallel.py:123-124](env_franka_parallel.py#L123-L124)).
 
 **On hardware**, do not send `move`/width goals — a width command below the
 object width is meaningless to `franka_gripper` and the timing will be wrong
@@ -297,14 +262,14 @@ gripper's force step response before spending time on the arm side.
 
 | quantity | status |
 |---|---|
-| control-error bias | **already baked into `target_z_vel`.** Each episode carries a constant `−U[0.03, 0.06] m/s` bias added before the acceleration clamp ([env_franka_parallel.py:1105-1120](examples/rigid/env_franka_parallel.py#L1105-L1120); note the sign line is commented out, so it is always downward). Replay `target_z*`, not `act_z_vel`, and you get it for free. |
+| control-error bias | **already baked into `target_z_vel`.** Each episode carries a constant `−U[0.03, 0.06] m/s` bias added before the acceleration clamp ([env_franka_parallel.py:1105-1120](env_franka_parallel.py#L1105-L1120); note the sign line is commented out, so it is always downward). Replay `target_z*`, not `act_z_vel`, and you get it for free. |
 | finger stiffness `kp` | **not recorded.** Drawn per episode from `U[100, 500] N/m`; it sets the squeeze force in the table above. Pick a force in the 1–6 N band and tune. |
 | friction draw | **not recorded.** Effective contact μ per episode from `U[0.6, 0.9]`. |
 | joint trajectory `q(t)` | **not recorded.** The CSV is a Cartesian z reference; joint angles come out of your own IK. |
 | observation noise | ±0.003 m on the measured channels, irrelevant to replay (it perturbed the policy, and the policy's output is already in the file). |
 
 To add `kp` (or joint angles) to the files, extend `STATE_COLS` and `state_row`
-in [eval_pulse_grid_traj_franka.py](examples/rigid/eval_pulse_grid_traj_franka.py) and re-run —
+in [eval_pulse_grid_traj_franka.py](eval_pulse_grid_traj_franka.py) and re-run —
 the RNG is reseeded per combination, so the same `-B 1 --seed 1` command
 regenerates the same episodes.
 
@@ -315,7 +280,7 @@ regenerates the same episodes.
 Reproduce the env's own test rather than eyeballing it. You need the bar pose
 relative to the fingertips; the sim's fingertip point is the finger link origin
 offset by `[0, 0.0055, 0.0445]` in the finger frame
-([env_franka_parallel.py:326](examples/rigid/env_franka_parallel.py#L326)), and
+([env_franka_parallel.py:326](env_franka_parallel.py#L326)), and
 `cuboid_rel_z = bar_centre_z − mean(left_tip_z, right_tip_z)`.
 
 Success ⇔ all of:
@@ -328,7 +293,7 @@ Success ⇔ all of:
 
 Failure in sim is `|cuboid_rel_x| > 0.04`, `|cuboid_rel_y| > 0.04`,
 `fingertip_dist < 0.01`, `|cuboid_rel_z| > 0.15`, or the hand leaving
-[0.6, 0.96] ([env_franka_parallel.py:855-862](examples/rigid/env_franka_parallel.py#L855-L862)).
+[0.6, 0.96] ([env_franka_parallel.py:855-862](env_franka_parallel.py#L855-L862)).
 The lateral ones are worth monitoring on hardware — that is the bar tipping out
 of the grasp.
 
@@ -344,7 +309,7 @@ Measured across all 12 files:
 | \|target_z_acc\| | **15.000 m/s²** | **13 m/s² ⚠️** |
 | \|Δacc/Δt\| at 50 Hz | 1352 m/s³ | 6500 m/s³ ✅ |
 
-`Z_ACC_MAX = 15.0` ([env_franka_parallel.py:116](examples/rigid/env_franka_parallel.py#L116))
+`Z_ACC_MAX = 15.0` ([env_franka_parallel.py:116](env_franka_parallel.py#L116))
 **exceeds the Panda's 13 m/s² Cartesian acceleration limit**, and the clamp is
 saturated constantly in these episodes — the reference is at ±15 m/s² on many
 steps. A verbatim replay will trip a Cartesian reflex or be clipped by the

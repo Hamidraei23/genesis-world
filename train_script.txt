@@ -1,0 +1,11 @@
+docker exec -it genesis python examples/rigid/train_franka_ppo.py \
+  --env env_franka_parallel_original \
+  -e test1 -B 1024 --max_iterations 1400 --randomize-at 450 --mix --normalization
+
+docker exec -it genesis python examples/rigid/train_franka_ppo.py \
+  --env env_franka_parallel_backup_2h \
+  -e test2 -B 1024 --max_iterations 1400 --randomize-at 450 --mix --normalization
+
+docker exec -it genesis python examples/rigid/train_franka_ppo.py \
+  --env env_franka_parallel \
+  -e test3 -B 1024 --max_iterations 1400 --randomize-at 450 --mix --normalization

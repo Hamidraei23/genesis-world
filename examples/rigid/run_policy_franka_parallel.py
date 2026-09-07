@@ -19,6 +19,9 @@ Usage:
     # Record an MP4
     python3 examples/rigid/run_policy_franka_parallel.py -e franka-lift-v1 --record
 
+    # Use the 2H observation layout and 2H-control checkpoints
+    python3 examples/rigid/run_policy_franka_parallel.py -e franka-lift-v1 --2H
+
 Checkpoints are loaded from:
     logs/<exp_name>/model_<iter>.pt
 """
@@ -48,6 +51,11 @@ try:
     from .env_franka_parallel import FrankaEnvParallel
 except ImportError:
     from env_franka_parallel import FrankaEnvParallel
+
+try:
+    from .env_franka_parallel_backup_2h import FrankaEnvParallel as FrankaEnvParallel2H
+except ImportError:
+    from env_franka_parallel_backup_2h import FrankaEnvParallel as FrankaEnvParallel2H
 
 
 def main():
@@ -82,6 +90,8 @@ def main():
                         help="After a gripper pulse, temporarily zero z velocity and close the gripper")
     parser.add_argument("--control-error", action="store_true", default=False,
                         help="Add per-episode constant z-velocity command bias in [-0.05, -0.03] U [0.03, 0.05]")
+    parser.add_argument("--2H", dest="use_2h", action="store_true", default=False,
+                        help="Use env_franka_parallel_backup_2h and logs/<exp_name>-2H-control")
     args = parser.parse_args()
 
     if args.record:
@@ -92,6 +102,10 @@ def main():
         raise ValueError("--render-every must be greater than 0")
 
     log_dir = f"logs/{args.exp_name}"
+    env_cls = FrankaEnvParallel
+    if args.use_2h:
+        env_cls = FrankaEnvParallel2H
+        log_dir = f"{log_dir}-2H-control"
 
     # ---- resolve checkpoint -----------------------------------------------
     if args.ckpt is not None:
@@ -112,7 +126,9 @@ def main():
     gs.init(backend=gs.gpu, precision="32", logging_level="warning")
 
     # record=True tells the env to add the camera BEFORE scene.build()
-    env = FrankaEnvParallel(
+    obs_cls = env_cls
+
+    env = env_cls(
         num_envs=1,
         vis=args.vis,
         record=args.record,
@@ -368,9 +384,9 @@ def main():
         """
         avg_force = _reward_term_float(reward_terms.get("avg_force"))
 
-        actual_z_vel = obs[0, FrankaEnvParallel.OBS_EE_VEL_Z].item()
-        cub_rel_z    = obs[0, FrankaEnvParallel.OBS_CUBOID_REL_Z].item()
-        des_rel_z    = obs[0, FrankaEnvParallel.OBS_DESIRED_REL_Z].item()
+        actual_z_vel = obs[0, obs_cls.OBS_EE_VEL_Z].item()
+        cub_rel_z    = obs[0, obs_cls.OBS_CUBOID_REL_Z].item()
+        des_rel_z    = obs[0, obs_cls.OBS_DESIRED_REL_Z].item()
 
         # Fingertip distance is not in the obs anymore; compute directly from env
         ft_dist = float(env.get_fingertip_distance())
@@ -385,8 +401,8 @@ def main():
         # motion detail
         bufs["target_z"].append(target_z)
         bufs["actual_z_vel"].append(actual_z_vel)
-        bufs["target_z_vel"].append(obs[0, FrankaEnvParallel.OBS_TARGET_Z_VEL].item())
-        bufs["target_z_acc"].append(obs[0, FrankaEnvParallel.OBS_TARGET_Z_ACC].item())
+        bufs["target_z_vel"].append(obs[0, obs_cls.OBS_TARGET_Z_VEL].item())
+        bufs["target_z_acc"].append(obs[0, obs_cls.OBS_TARGET_Z_ACC].item())
         bufs["actual_z_acc"].append(actual_z_acc)
         bufs["z_error"].append(abs(cub_rel_z - des_rel_z))
         # reward parts
@@ -444,9 +460,9 @@ def main():
                     unnorm_obs = obs * _obs_scale_for(obs)
                 else:
                     unnorm_obs = obs
-                    
+
                 target_z = env.target_z[0].item()
-                actual_z_vel_cur = unnorm_obs[0, FrankaEnvParallel.OBS_EE_VEL_Z].item()
+                actual_z_vel_cur = unnorm_obs[0, obs_cls.OBS_EE_VEL_Z].item()
                 actual_z_acc_cur = (
                     (actual_z_vel_cur - prev_actual_z_vel) / env.target_period
                     if prev_actual_z_vel is not None else 0.0
@@ -499,10 +515,10 @@ def main():
                     f"ee_vel_z={_o[1]:+.4f}  "
                     f"target_z_vel={_o[2]:+.4f}  "
                     f"target_z_acc={_o[3]:+.4f}  "
-                    f"cuboid_rel_z={_o[FrankaEnvParallel.OBS_CUBOID_REL_Z]:+.4f}  "
-                    f"cuboid_rel_x={_o[FrankaEnvParallel.OBS_CUBOID_REL_X]:+.4f}  "
-                    f"cuboid_rel_y={_o[FrankaEnvParallel.OBS_CUBOID_REL_Y]:+.4f}  "
-                    f"desired_rel_z={_o[FrankaEnvParallel.OBS_DESIRED_REL_Z]:+.4f}"
+                    f"cuboid_rel_z={_o[obs_cls.OBS_CUBOID_REL_Z]:+.4f}  "
+                    f"cuboid_rel_x={_o[obs_cls.OBS_CUBOID_REL_X]:+.4f}  "
+                    f"cuboid_rel_y={_o[obs_cls.OBS_CUBOID_REL_Y]:+.4f}  "
+                    f"desired_rel_z={_o[obs_cls.OBS_DESIRED_REL_Z]:+.4f}"
                 )
                 ep_reward += reward_cur
                 ep_len += 1

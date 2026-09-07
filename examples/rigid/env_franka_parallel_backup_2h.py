@@ -99,8 +99,8 @@ class FrankaEnvParallel:
     OBS_CUBOID_REL_Y   = 8
     OBS_DESIRED_REL_Z  = 9
     OBS_LAST_Z_IMPROVE_START = 10
-    OBS_NEXT_NEG_VEL_MS_START = 15
-    OBS_LAST_NEG_VEL_MS_START = 20
+    OBS_NEXT_NEG_VEL_MS_START = 12
+    OBS_LAST_NEG_VEL_MS_START = 14
 
     # Fixed observation normalization scales (divide raw obs by these)
     # Order: ee_pos_z, ee_vel_z, target_z_vel, target_z_acc,
@@ -130,7 +130,8 @@ class FrankaEnvParallel:
     AMBIGUOUS_FORCE_PENALTY = 10.0
     FREE_FORCE_REWARD = 1.0
     REGRASP_BONUS           = 75.0  # duration-weighted reward scale for successful regrasp events
-    REGRASP_TERMINATION_COUNT = 4
+    REGRASP_TERMINATION_COUNT = 7   # fail on the 7th regrasp if not successful by then
+    REGRASP_BONUS_MAX_COUNT = 4     # regrasp bonus paid only for the first 4 regrasps
     FIRM_GRASP_SLIP_PENALTY_WEIGHT = 30.0  # harsh penalty per (m/step)² of Z-slip during firm grasp
     SUCCESS_EE_Z_MIN = 0.7
     SUCCESS_EE_Z_MAX = 0.86
@@ -140,10 +141,10 @@ class FrankaEnvParallel:
     EE_HOLD_VEL_TOLERANCE = 0.02
     EE_HOLD_REQUIRED_STEPS = 5
     EE_HOLD_ACC_THRESHOLD = 2.0
-    PULSE_DELAY_STEPS = 4   # target-period steps to wait before the open window begins
-    PULSE_DELAY_RANDOM_MIN = 0
-    PULSE_DELAY_RANDOM_MAX = 4
-    PULSE_LENGTH = 4   # steps: 5 open, 1 close, then back to policy control
+    PULSE_DELAY_STEPS = 2   # target-period steps to wait before the open window begins
+    PULSE_DELAY_RANDOM_MIN = 1
+    PULSE_DELAY_RANDOM_MAX = 3
+    PULSE_LENGTH = 4   # steps: open window, then 1 close step, back to policy control
     PULSE_LENGTH_RANDOM_MIN = 3
     PULSE_LENGTH_RANDOM_MAX = 6
     ZERO_HOLD_DURATION_MIN = 0.1  # seconds
@@ -891,10 +892,10 @@ class FrankaEnvParallel:
         self._in_release = (self._in_release | fully_released) & (~regrasp_event)
 
         # Optional: terminate episode after too many regrasps
-        if self.limit_regrasp:
-            limit_fail = regrasp_event & (self._regrasp_count + 1 >= self.REGRASP_TERMINATION_COUNT)
-            fail    = fail    | limit_fail
-            success_candidate = success_candidate & ~limit_fail
+        # Always terminate as failure on the REGRASP_TERMINATION_COUNT-th regrasp
+        limit_fail = regrasp_event & (self._regrasp_count + 1 >= self.REGRASP_TERMINATION_COUNT)
+        fail    = fail    | limit_fail
+        success_candidate = success_candidate & ~limit_fail
 
         success_candidate = success_candidate & (~fail)
         self._success_steps = torch.where(
@@ -924,8 +925,11 @@ class FrankaEnvParallel:
             raw_regrasp_bonus * 5.0,
             raw_regrasp_bonus,
         )
+        # Bonus only for the first REGRASP_BONUS_MAX_COUNT regrasps. _regrasp_count was
+        # already incremented above, so the k-th regrasp event sees _regrasp_count == k.
+        bonus_eligible = regrasp_event & (self._regrasp_count <= self.REGRASP_BONUS_MAX_COUNT)
         regrasp_bonus = (
-            raw_regrasp_bonus * regrasp_event.float()
+            raw_regrasp_bonus * bonus_eligible.float()
         )  # (N,)
 
         # ---- jerk penalty: penalise jerky EE velocity commands ----

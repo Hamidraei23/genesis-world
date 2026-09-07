@@ -125,21 +125,22 @@ class FrankaEnvParallel:
     AMBIGUOUS_FORCE_PENALTY = 10.0
     FREE_FORCE_REWARD = 1.0
     REGRASP_BONUS           = 75.0  # duration-weighted reward scale for successful regrasp events
-    REGRASP_TERMINATION_COUNT = 4
+    REGRASP_TERMINATION_COUNT = 7   # fail on the 7th regrasp if not successful by then
+    REGRASP_BONUS_MAX_COUNT = 4     # regrasp bonus paid only for the first 4 regrasps
     FIRM_GRASP_SLIP_PENALTY_WEIGHT = 30.0  # harsh penalty per (m/step)² of Z-slip during firm grasp
-    SUCCESS_EE_Z_MIN = 0.78
-    SUCCESS_EE_Z_MAX = 0.82
+    SUCCESS_EE_Z_MIN = 0.7
+    SUCCESS_EE_Z_MAX = 0.86
     SUCCESS_REQUIRED_STEPS = 1
     EE_HOLD_Z_TARGET = 0.8
     EE_HOLD_Z_TOLERANCE = 0.025
     EE_HOLD_VEL_TOLERANCE = 0.02
     EE_HOLD_REQUIRED_STEPS = 5
     EE_HOLD_ACC_THRESHOLD = 2.0
-    PULSE_DELAY_STEPS = 1   # target-period steps to wait before the open window begins
-    PULSE_DELAY_RANDOM_MIN = 0
-    PULSE_DELAY_RANDOM_MAX = 1
-    PULSE_LENGTH = 5   # steps: 5 open, 1 close, then back to policy control
-    PULSE_LENGTH_RANDOM_MIN = 4
+    PULSE_DELAY_STEPS = 2   # target-period steps to wait before the open window begins
+    PULSE_DELAY_RANDOM_MIN = 1
+    PULSE_DELAY_RANDOM_MAX = 3
+    PULSE_LENGTH = 4   # steps: open window, then 1 close step, back to policy control
+    PULSE_LENGTH_RANDOM_MIN = 3
     PULSE_LENGTH_RANDOM_MAX = 6
     # Post-pulse hold penalty: after pulse completes, wait 0.5s, then penalise instability for 0.5s
     POST_PULSE_DELAY_DURATION = 0.5  # wait before evaluation window
@@ -716,10 +717,10 @@ class FrankaEnvParallel:
         self._in_release = (self._in_release | fully_released) & (~regrasp_event)
 
         # Optional: terminate episode after too many regrasps
-        if self.limit_regrasp:
-            limit_fail = regrasp_event & (self._regrasp_count + 1 >= self.REGRASP_TERMINATION_COUNT)
-            fail    = fail    | limit_fail
-            success_candidate = success_candidate & ~limit_fail
+        # Always terminate as failure on the REGRASP_TERMINATION_COUNT-th regrasp
+        limit_fail = regrasp_event & (self._regrasp_count + 1 >= self.REGRASP_TERMINATION_COUNT)
+        fail    = fail    | limit_fail
+        success_candidate = success_candidate & ~limit_fail
 
         success_candidate = success_candidate & (~fail)
         self._success_steps = torch.where(
@@ -747,24 +748,27 @@ class FrankaEnvParallel:
             raw_regrasp_bonus * 5.0,
             raw_regrasp_bonus,
         )
+        # Bonus only for the first REGRASP_BONUS_MAX_COUNT regrasps. _regrasp_count was
+        # already incremented above, so the k-th regrasp event sees _regrasp_count == k.
+        bonus_eligible = regrasp_event & (self._regrasp_count <= self.REGRASP_BONUS_MAX_COUNT)
         regrasp_bonus = (
-            raw_regrasp_bonus * regrasp_event.float()
+            raw_regrasp_bonus * bonus_eligible.float()
         )  # (N,)
 
         # ---- jerk penalty: penalise jerky EE velocity commands ----
         jerk         = (self.target_z_vel - self.prev_target_z_vel) / self.Z_VEL_MAX  # (N,)
         # jerk_penalty = torch.where(fully_released, torch.zeros_like(jerk), -1.0 * jerk.pow(2))  # (N,)
-        jerk_penalty = -1.0 * jerk.pow(2)       
+        jerk_penalty = -0.2 * jerk.pow(2)
 
         # ---- terminal reward (dominates with gamma=0.99) ----
         ep = self.episode_length_buf.float()
         base_reward = torch.where(
             success,
-            1000.0 - ep * 0.5,                          # up to 1000; small time penalty
+            3000.0 - ep * 0.5,                          # up to 3000; small time penalty
             torch.where(
                 fail | timeout,
                 torch.full_like(ee_z, -250.0),
-                torch.full_like(ee_z, -0.25),             # alive penalty: urgency to finish
+                torch.full_like(ee_z, -1.25),             # alive penalty: urgency to finish
             ),
         )
 
@@ -791,7 +795,7 @@ class FrankaEnvParallel:
         )
         self._post_pulse_delay_countdown = (self._post_pulse_delay_countdown - 1).clamp(min=0)
 
-        reward = base_reward + regrasp_bonus + jerk_penalty + post_pulse_hold_penalty
+        reward = base_reward + regrasp_bonus*2.0 + jerk_penalty + post_pulse_hold_penalty
 
         self.last_reward_terms = {
             "base_reward":   base_reward.detach().clone(),
