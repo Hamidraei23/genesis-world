@@ -4,34 +4,27 @@ How to reproduce, on hardware, the exact motion recorded in
 `logs/franka-lift-v1-student-ft3/traj_vis/` by
 [eval_pulse_grid_traj_franka.py](examples/rigid/eval_pulse_grid_traj_franka.py).
 
-Watch `traj_d2_l4.mp4` before reading further — the motion is not what "2 cm lift"
-sounds like, and everything below depends on understanding what it actually is.
-
 ## Watch it first
-<video src="logs/franka-lift-v1-student-ft3/traj_vis/traj_d2_l4.mp4" controls muted loop width="720"></video>
 
-`traj_d2_l4.mp4` — pulse delay 2 (40 ms), pulse length 4 (80 ms), 3 pulses, 1.10 s.
+The motion is not what "2 cm lift" sounds like — the bar never leaves the grasp,
+and the hand ends up *lower* than it started. Everything below depends on seeing
+that first.
 
-All twelve:
+<table>
+<tr>
+<td align="center"><img src="imgs/traj/traj_d2_l4.gif" width="320"><br><b>d2_l4</b><br><sub>3 pulses · 1.10 s · hand −38 mm · slip +22 mm</sub></td>
+<td align="center"><img src="imgs/traj/traj_d2_l6.gif" width="320"><br><b>d2_l6</b><br><sub>2 pulses · 0.68 s · hand −56 mm · slip +19 mm</sub></td>
+<td align="center"><img src="imgs/traj/traj_d1_l3.gif" width="320"><br><b>d1_l3</b><br><sub>9 pulses · 2.40 s · hand −88 mm · slip +24 mm</sub></td>
+</tr>
+</table>
 
-<table><tr>
-<td><video src="logs/franka-lift-v1-student-ft3/traj_vis/traj_d1_l3.mp4" controls muted loop width="320"></video><br><sub>d1_l3</sub></td>
-<td><video src="logs/franka-lift-v1-student-ft3/traj_vis/traj_d1_l4.mp4" controls muted loop width="320"></video><br><sub>d1_l4</sub></td>
-<td><video src="logs/franka-lift-v1-student-ft3/traj_vis/traj_d1_l5.mp4" controls muted loop width="320"></video><br><sub>d1_l5</sub></td>
-<td><video src="logs/franka-lift-v1-student-ft3/traj_vis/traj_d1_l6.mp4" controls muted loop width="320"></video><br><sub>d1_l6</sub></td>
-</tr><tr>
-<td><video src="logs/franka-lift-v1-student-ft3/traj_vis/traj_d2_l3.mp4" controls muted loop width="320"></video><br><sub>d2_l3</sub></td>
-<td><video src="logs/franka-lift-v1-student-ft3/traj_vis/traj_d2_l4.mp4" controls muted loop width="320"></video><br><sub>d2_l4</sub></td>
-<td><video src="logs/franka-lift-v1-student-ft3/traj_vis/traj_d2_l5.mp4" controls muted loop width="320"></video><br><sub>d2_l5</sub></td>
-<td><video src="logs/franka-lift-v1-student-ft3/traj_vis/traj_d2_l6.mp4" controls muted loop width="320"></video><br><sub>d2_l6</sub></td>
-</tr><tr>
-<td><video src="logs/franka-lift-v1-student-ft3/traj_vis/traj_d3_l3.mp4" controls muted loop width="320"></video><br><sub>d3_l3</sub></td>
-<td><video src="logs/franka-lift-v1-student-ft3/traj_vis/traj_d3_l4.mp4" controls muted loop width="320"></video><br><sub>d3_l4</sub></td>
-<td><video src="logs/franka-lift-v1-student-ft3/traj_vis/traj_d3_l5.mp4" controls muted loop width="320"></video><br><sub>d3_l5</sub></td>
-<td><video src="logs/franka-lift-v1-student-ft3/traj_vis/traj_d3_l6.mp4" controls muted loop width="320"></video><br><sub>d3_l6</sub></td>
-</tr></table>
+Each gif is one successful episode: the grasp point ratchets 2 cm along the bar,
+one grip-release pulse at a time. `d2_l6` does it in two pulses, `d1_l3` needs
+nine.
 
-> GitHub does not play `<video>` from a repo path; open the files locally (`logs/franka-lift-v1-student-ft3/traj_vis/`) or in the VS Code markdown preview.
+Full-resolution video for all twelve combinations is in
+`logs/franka-lift-v1-student-ft3/traj_vis/traj_d<D>_l<L>.mp4` (50 fps, real
+time); the gifs above are downsampled to 20 fps.
 
 ---
 
