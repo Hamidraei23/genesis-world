@@ -113,10 +113,10 @@ class FrankaEnvParallel:
 
     # Action scaling constants
     Z_VEL_MAX       = 0.6
-    Z_ACC_MAX       = 15.00   # m/s² — hard limit on target-velocity rate of change
-    Z_ACC_PENALTY_THRESHOLD = 13.0
+    Z_ACC_MAX       = 16.00   # m/s² — hard limit on target-velocity rate of change
+    Z_ACC_PENALTY_THRESHOLD = 15.0
     Z_ACC_PENALTY_WEIGHT    = 0.0
-    EE_Z_TARGET     = 0.7
+    EE_Z_TARGET     = 0.8
     GRIPPER_CLOSED  = 0.000251
     GRIPPER_OPEN    = 0.0124
     # Release-to-regrasp detection
@@ -124,19 +124,19 @@ class FrankaEnvParallel:
     REGRASP_FORCE_THRESHOLD = 0.75  # N: avg finger force at/above this -> firm grasp
     AMBIGUOUS_FORCE_PENALTY = 10.0
     FREE_FORCE_REWARD = 1.0
-    REGRASP_BONUS           = 75.0  # duration-weighted reward scale for successful regrasp events
+    REGRASP_BONUS           = 200.0  # duration-weighted reward scale for successful regrasp events
     REGRASP_TERMINATION_COUNT = 7   # fail on the 7th regrasp if not successful by then
     REGRASP_BONUS_MAX_COUNT = 4     # regrasp bonus paid only for the first 4 regrasps
-    FIRM_GRASP_SLIP_PENALTY_WEIGHT = 30.0  # harsh penalty per (m/step)² of Z-slip during firm grasp
+    FIRM_GRASP_SLIP_PENALTY_WEIGHT = 15.0  # harsh penalty per (m/step)² of Z-slip during firm grasp
     SUCCESS_EE_Z_MIN = 0.7
     SUCCESS_EE_Z_MAX = 0.86
     SUCCESS_REQUIRED_STEPS = 1
     EE_HOLD_Z_TARGET = 0.8
     EE_HOLD_Z_TOLERANCE = 0.025
-    EE_HOLD_VEL_TOLERANCE = 0.02
-    EE_HOLD_REQUIRED_STEPS = 5
+    EE_HOLD_VEL_TOLERANCE = 0.04
+    EE_HOLD_REQUIRED_STEPS = 1
     EE_HOLD_ACC_THRESHOLD = 2.0
-    PULSE_DELAY_STEPS = 2   # target-period steps to wait before the open window begins
+    PULSE_DELAY_STEPS = 0   # target-period steps to wait before the open window begins
     PULSE_DELAY_RANDOM_MIN = 1
     PULSE_DELAY_RANDOM_MAX = 3
     PULSE_LENGTH = 4   # steps: 5 open, 1 close, then back to policy control
@@ -147,10 +147,26 @@ class FrankaEnvParallel:
     # Post-pulse hold penalty: after pulse completes, wait 0.5s, then penalise instability for 0.5s
     POST_PULSE_DELAY_DURATION = 0.5  # wait before evaluation window
     POST_PULSE_HOLD_DURATION = 0.5   # seconds
-    POST_PULSE_HOLD_PENALTY_Z = 200.0    # per-step penalty weight for distance from target
-    POST_PULSE_HOLD_PENALTY_VEL = 200.0  # per-step penalty weight for velocity excess
+    POST_PULSE_HOLD_PENALTY_Z = 40.0    # per-step penalty weight for distance from target
+    POST_PULSE_HOLD_PENALTY_VEL = 40.0  # per-step penalty weight for velocity excess
     POST_PULSE_HOLD_Z_TARGET = 0.8   # desired ee_z during hold
     POST_PULSE_HOLD_VEL_MAX = 0.03   # deadzone for velocity penalty
+    # Commanded-z-velocity penalty (gated by minimize_vel): free below the deadzone,
+    # then grows exponentially from _MIN at the deadzone to _MAX at Z_VEL_MAX.
+    VEL_CMD_PENALTY_DEADZONE = 0.3   # m/s: |commanded z-vel| at or below this costs nothing
+    VEL_CMD_PENALTY_MIN = 10.0       # penalty magnitude just past the deadzone
+    VEL_CMD_PENALTY_MAX = 60.0       # penalty magnitude at |commanded z-vel| = Z_VEL_MAX
+    # Progressive shaping on the remaining cuboid-z error, potential-based.
+    # Phi is PROGRESS_POTENTIAL_MAX at zero error and 0 at PROGRESS_POTENTIAL_RANGE,
+    # exponential in between. Paid as gamma * Phi(s') - Phi(s), so the policy is
+    # paid for error it removes, never for proximity it merely holds for a step.
+    # The episode total telescopes to -Phi(s0), so this cannot be farmed.
+    REWARD_GAMMA = 0.99               # must equal the PPO gamma; train script asserts it
+    PROGRESS_POTENTIAL_MAX = 1000.0   # potential at zero error
+    PROGRESS_POTENTIAL_RANGE = 0.04   # m: error at or beyond this has zero potential
+    PROGRESS_POTENTIAL_DECAY = 0.01   # m: e-folding length of the exponential
+    # Reward terms summed over each episode and reported in extras["episode"]
+    EP_LOG_TERMS = ("total", "base", "regrasp", "progress", "jerk", "vel_cmd", "hold")
     FINGER_GAIN_RANDOM_MIN = 100.0
     FINGER_GAIN_RANDOM_MAX = 500.0
     # Friction domain randomisation: effective contact μ sampled each episode
@@ -180,6 +196,7 @@ class FrankaEnvParallel:
         normalize: bool = False,
         zero: bool = False,
         control_error: bool = False,
+        minimize_vel: bool = False,
     ):
         self.num_envs = num_envs
         self.device = gs.device
@@ -196,6 +213,12 @@ class FrankaEnvParallel:
         self.normalize = normalize
         self.zero = zero
         self.control_error = control_error
+        self.minimize_vel = minimize_vel
+        # Exponential rate that carries the velocity penalty from _MIN at the
+        # deadzone to _MAX at Z_VEL_MAX: MIN * exp(rate * (Z_VEL_MAX - deadzone)) == MAX
+        self._vel_cmd_penalty_rate = math.log(
+            self.VEL_CMD_PENALTY_MAX / self.VEL_CMD_PENALTY_MIN
+        ) / (self.Z_VEL_MAX - self.VEL_CMD_PENALTY_DEADZONE)
         self.extras: dict = {}
         self.cfg = {
             "num_envs": num_envs,
@@ -214,6 +237,7 @@ class FrankaEnvParallel:
             "normalize": normalize,
             "zero": zero,
             "control_error": control_error,
+            "minimize_vel": minimize_vel,
             "success_ee_z_min": self.SUCCESS_EE_Z_MIN,
             "success_ee_z_max": self.SUCCESS_EE_Z_MAX,
             "success_required_steps": self.SUCCESS_REQUIRED_STEPS,
@@ -366,6 +390,10 @@ class FrankaEnvParallel:
             self.reset_buf = torch.zeros(N, dtype=torch.bool, device=self.device)
             self.direction_change_count = torch.zeros(N, dtype=torch.long, device=self.device)
             self.last_reward_terms = {}
+            # Per-episode reward-term accumulators, published via extras["episode"]
+            self._ep_term_sums = {
+                k: torch.zeros(N, device=self.device) for k in self.EP_LOG_TERMS
+            }
             # Release-to-regrasp tracking
             self._in_release = torch.zeros(N, dtype=torch.bool, device=self.device)
             self._regrasp_count = torch.zeros(N, dtype=torch.long, device=self.device)
@@ -380,6 +408,8 @@ class FrankaEnvParallel:
             self._pre_success = torch.zeros(N, dtype=torch.bool, device=self.device)
             self._ee_hold_steps = torch.zeros(N, dtype=torch.long, device=self.device)
             self._ee_hold_complete = torch.zeros(N, dtype=torch.bool, device=self.device)
+            # Potential-based progress shaping: Phi of the previous step
+            self._prev_potential = torch.zeros(N, device=self.device)
             # Firm-grasp Z-slip tracking
             self._prev_cuboid_rel_z = torch.zeros(N, device=self.device)
             # Regrasp improvement tracking: cuboid_rel_z at the moment of release
@@ -413,6 +443,8 @@ class FrankaEnvParallel:
             self._post_pulse_hold_countdown = torch.zeros(N, dtype=torch.long, device=self.device)
             # Observation histories (oldest -> newest)
             self._z_improve_hist = torch.zeros(N, self.HISTORY_LEN, device=self.device)
+            # Per-episode sum of z_improvement over regrasp events (for logging)
+            self._z_improve_sum = torch.zeros(N, device=self.device)
             self._pulse_to_next_neg_vel_ms_hist = torch.zeros(N, self.HISTORY_LEN, device=self.device)
             self._pulse_to_last_neg_vel_ms_hist = torch.zeros(N, self.HISTORY_LEN, device=self.device)
             # Per-pulse transient state for timing extraction
@@ -456,6 +488,8 @@ class FrankaEnvParallel:
             _mag = -_mag   # negative desired_rel_z → solid-up training regime
         self.desired_rel_z[envs_idx] = _mag
         self.episode_length_buf[envs_idx] = 0
+        for _term_sum in self._ep_term_sums.values():
+            _term_sum[envs_idx] = 0.0
         self._in_release[envs_idx] = False
         self._regrasp_count[envs_idx] = 0
         self._release_start_step[envs_idx] = -1
@@ -486,6 +520,7 @@ class FrankaEnvParallel:
         self._post_pulse_delay_countdown[envs_idx] = 0
         self._post_pulse_hold_countdown[envs_idx] = 0
         self._z_improve_hist[envs_idx] = 0.0
+        self._z_improve_sum[envs_idx] = 0.0
         self._pulse_to_next_neg_vel_ms_hist[envs_idx] = 0.0
         self._pulse_to_last_neg_vel_ms_hist[envs_idx] = 0.0
         self._pulse_open_start_ms[envs_idx] = 0.0
@@ -508,6 +543,8 @@ class FrankaEnvParallel:
             qvel = torch.zeros(_n, 9, device=self.device)
             qvel[:, :7] = qvel_noise
             self.franka.set_dofs_velocity(qvel, envs_idx=envs_idx)
+
+        self._seed_progress_potential(envs_idx)
 
         self.sim_step = 0
 
@@ -744,6 +781,7 @@ class FrankaEnvParallel:
         self.episode_length_buf += 1
         done, reward, timeout = self._compute_done_and_reward()
         done_idx = done.nonzero(as_tuple=False).squeeze(-1)
+        self._update_episode_extras(done_idx)
         if done_idx.numel() > 0:
             self._reset_idx(done_idx)
         self.rew_buf = reward
@@ -751,6 +789,44 @@ class FrankaEnvParallel:
         self.extras["time_outs"] = timeout.float()
         self._update_obs_buf()
         return self.get_observations(), self.rew_buf, self.reset_buf, self.extras
+
+    def _update_episode_extras(self, done_idx: torch.Tensor):
+        """
+        Publish mean per-episode reward terms and outcome rates for the envs that
+        just finished, under extras["episode"] (the key rsl_rl aggregates and logs).
+
+        Must be called before _reset_idx() clears the accumulators.
+        """
+        if done_idx.numel() == 0:
+            # extras persists across steps; drop stale data so it is not re-counted
+            self.extras.pop("episode", None)
+            return
+
+        t = self.last_reward_terms
+        # success excludes fail by construction; timeout may coincide with fail
+        succ = t["success"][done_idx]
+        fail = t["fail"][done_idx] * (1.0 - succ)
+        tout = t["timeout"][done_idx] * (1.0 - succ) * (1.0 - fail)
+
+        episode = {f"rew_{k}": v[done_idx].mean() for k, v in self._ep_term_sums.items()}
+        episode["outcome_success"] = succ.mean()
+        episode["outcome_fail"] = fail.mean()
+        episode["outcome_timeout"] = tout.mean()
+        episode["regrasp_count"] = self._regrasp_count[done_idx].float().mean()
+        # Mean z_improvement per regrasp event, in mm, over episodes that regrasped
+        _n_regrasp = self._regrasp_count[done_idx].float()
+        _has_regrasp = _n_regrasp > 0
+        if _has_regrasp.any():
+            _per_event = (
+                self._z_improve_sum[done_idx][_has_regrasp] / _n_regrasp[_has_regrasp]
+            )
+            episode["z_improve_mm"] = _per_event.mean() * 1000.0
+
+        episode["ep_len"] = self.episode_length_buf[done_idx].float().mean()
+        # How many episodes these means cover, so the training table can weight
+        # each step's contribution instead of averaging means of unequal samples.
+        episode["n_episodes"] = torch.tensor(float(done_idx.numel()), device=self.device)
+        self.extras["episode"] = episode
 
     # ------------------------------------------------------------------ #
     # Observations                                                        #
@@ -809,6 +885,8 @@ class FrankaEnvParallel:
           1. Terminal:       success +1000 (minus small time penalty), fail/timeout -250
           2. Regrasp bonus:  up to +250 per regrasp, ONLY if z_error improved; zero otherwise
           3. Jerk penalty:   -0.5 * (Δv / Z_VEL_MAX)^2 per step
+          4. (opt-in, --minimze_vel) Velocity penalty: 0 for |v| <= 0.3 m/s, then
+             exponential from -10 to -60 at Z_VEL_MAX, per step
 
         Opening the gripper alone gives no reward — only completing release→regrasp
         that moves the cuboid closer to desired_rel_z is rewarded.
@@ -858,7 +936,7 @@ class FrankaEnvParallel:
             | (fingertip_dist < 0.01)
             | (cuboid_rel_z.abs() > 0.15)
             | (ee_z < 0.6)
-            | (ee_z > 0.96)
+            | (ee_z > 0.95)
         )
 
         # ---- regrasp event tracking ----
@@ -905,6 +983,19 @@ class FrankaEnvParallel:
         z_err_after   = (cuboid_rel_z               - self.desired_rel_z).abs()  # (N,)
         z_improvement = z_err_before - z_err_after                               # (N,) positive = closer
         self._push_history(self._z_improve_hist, z_improvement, regrasp_event)
+        self._z_improve_sum += torch.where(
+            regrasp_event, z_improvement, torch.zeros_like(z_improvement)
+        )
+
+        # ---- progressive shaping: potential-based, paid on change, not per step ----
+        # gamma * Phi(s') - Phi(s). True terminals absorb, so Phi is zeroed there;
+        # timeout keeps its potential because rsl_rl bootstraps truncated episodes.
+        potential = self._progress_potential(z_err_after)
+        terminal_potential = torch.where(
+            success | fail, torch.zeros_like(potential), potential
+        )
+        progress_reward = self.REWARD_GAMMA * terminal_potential - self._prev_potential
+        self._prev_potential = potential.clone()
         # print(f"z_improvement: {z_improvement.mean().item():.4f}, z_err_before: {z_err_before.mean().item():.4f}, z_err_after: {z_err_after.mean().item():.4f}")    
         raw_regrasp_bonus = (z_improvement.clamp(min=-0.05) * 15000.0).clamp(max=250.0)
         raw_regrasp_bonus = torch.where(
@@ -922,7 +1013,19 @@ class FrankaEnvParallel:
         # ---- jerk penalty: penalise jerky EE velocity commands ----
         jerk         = (self.target_z_vel - self.prev_target_z_vel) / self.Z_VEL_MAX  # (N,)
         # jerk_penalty = torch.where(fully_released, torch.zeros_like(jerk), -1.0 * jerk.pow(2))  # (N,)
-        jerk_penalty = -0.2 * jerk.pow(2)       
+        jerk_penalty = -0.1 * jerk.pow(2)
+
+        # ---- velocity-minimization penalty: exponential in |commanded z-vel|, opt-in via --minimze_vel ----
+        # Zero at/below VEL_CMD_PENALTY_DEADZONE, then -10 rising to -60 at Z_VEL_MAX.
+        vel_cmd_penalty = torch.zeros_like(ee_z)
+        if self.minimize_vel:
+            z_vel_cmd = self.target_z_vel.abs()                                    # (N,)
+            excess = (z_vel_cmd - self.VEL_CMD_PENALTY_DEADZONE).clamp(min=0.0)    # (N,)
+            vel_cmd_penalty = torch.where(
+                z_vel_cmd > self.VEL_CMD_PENALTY_DEADZONE,
+                -self.VEL_CMD_PENALTY_MIN * torch.exp(self._vel_cmd_penalty_rate * excess),
+                torch.zeros_like(z_vel_cmd),
+            )
 
         # ---- terminal reward (dominates with gamma=0.99) ----
         ep = self.episode_length_buf.float()
@@ -959,12 +1062,26 @@ class FrankaEnvParallel:
         )
         self._post_pulse_delay_countdown = (self._post_pulse_delay_countdown - 1).clamp(min=0)
 
-        reward = base_reward + regrasp_bonus*2.0 + jerk_penalty + post_pulse_hold_penalty
+        reward = (base_reward + regrasp_bonus*2.0 + progress_reward + jerk_penalty
+                  + post_pulse_hold_penalty + vel_cmd_penalty)
+
+        # Accumulate each term's episode total; _update_episode_extras() reads these
+        # for finished envs before _reset_idx() zeroes them.
+        self._ep_term_sums["total"]   += reward
+        self._ep_term_sums["base"]    += base_reward
+        self._ep_term_sums["regrasp"] += regrasp_bonus
+        self._ep_term_sums["progress"] += progress_reward
+        self._ep_term_sums["jerk"]    += jerk_penalty
+        self._ep_term_sums["vel_cmd"] += vel_cmd_penalty
+        self._ep_term_sums["hold"]    += post_pulse_hold_penalty
 
         self.last_reward_terms = {
             "base_reward":   base_reward.detach().clone(),
             "regrasp_bonus": regrasp_bonus.detach().clone(),
+            "progress_reward": progress_reward.detach().clone(),
+            "potential": potential.detach().clone(),
             "jerk_penalty":  jerk_penalty.detach().clone(),
+            "vel_cmd_penalty": vel_cmd_penalty.detach().clone(),
             "z_improvement": z_improvement.detach().clone(),
             "avg_force":     avg_force.detach().clone(),
             "regrasp_event": regrasp_event.float().detach().clone(),
@@ -1006,6 +1123,8 @@ class FrankaEnvParallel:
             _mag = -_mag   # negative desired_rel_z → solid-up training regime
         self.desired_rel_z[envs_idx] = _mag
         self.episode_length_buf[envs_idx] = 0
+        for _term_sum in self._ep_term_sums.values():
+            _term_sum[envs_idx] = 0.0
         self._in_release[envs_idx] = False
         self._regrasp_count[envs_idx] = 0
         self._release_start_step[envs_idx] = -1
@@ -1033,6 +1152,7 @@ class FrankaEnvParallel:
         self._post_pulse_delay_countdown[envs_idx] = 0
         self._post_pulse_hold_countdown[envs_idx] = 0
         self._z_improve_hist[envs_idx] = 0.0
+        self._z_improve_sum[envs_idx] = 0.0
         self._pulse_to_next_neg_vel_ms_hist[envs_idx] = 0.0
         self._pulse_to_last_neg_vel_ms_hist[envs_idx] = 0.0
         self._pulse_open_start_ms[envs_idx] = 0.0
@@ -1049,6 +1169,8 @@ class FrankaEnvParallel:
             qvel = torch.zeros(_n, 9, device=self.device)
             qvel[:, :7] = qvel_noise
             self.franka.set_dofs_velocity(qvel, envs_idx=envs_idx)
+
+        self._seed_progress_potential(envs_idx)
 
     # ------------------------------------------------------------------ #
     # Internal: friction randomisation                                    #
@@ -1118,6 +1240,25 @@ class FrankaEnvParallel:
             self._episode_control_error[envs_idx] = - mag
         else:
             self._episode_control_error[envs_idx] = 0.0
+
+    def _progress_potential(self, z_err: torch.Tensor) -> torch.Tensor:
+        """Exponential potential on |cuboid_rel_z - desired_rel_z|.
+
+        PROGRESS_POTENTIAL_MAX at zero error, exactly 0 at PROGRESS_POTENTIAL_RANGE
+        and beyond, decaying with an e-folding length of PROGRESS_POTENTIAL_DECAY.
+        """
+        scaled = z_err.clamp(0.0, self.PROGRESS_POTENTIAL_RANGE) / self.PROGRESS_POTENTIAL_DECAY
+        edge = math.exp(-self.PROGRESS_POTENTIAL_RANGE / self.PROGRESS_POTENTIAL_DECAY)
+        return self.PROGRESS_POTENTIAL_MAX * (torch.exp(-scaled) - edge) / (1.0 - edge)
+
+    def _seed_progress_potential(self, envs_idx: torch.Tensor):
+        """Seed Phi for freshly reset envs so step 1 pays no spurious jump."""
+        cuboid_pos = self.cuboid.get_pos()
+        left_ft = self._fingertip_pos(self.left_finger)
+        right_ft = self._fingertip_pos(self.right_finger)
+        finger_mid_z = (left_ft[:, 2] + right_ft[:, 2]) * 0.5
+        z_err = (cuboid_pos[:, 2] - finger_mid_z - self.desired_rel_z).abs()
+        self._prev_potential[envs_idx] = self._progress_potential(z_err)[envs_idx]
 
     def _sample_zero_hold_steps(self, envs_idx: torch.Tensor):
         """Set per-env zero-hold duration in high-level steps.

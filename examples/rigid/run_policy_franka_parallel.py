@@ -57,6 +57,11 @@ try:
 except ImportError:
     from env_franka_parallel_backup_2h import FrankaEnvParallel as FrankaEnvParallel2H
 
+try:
+    from .train_franka_ppo import build_env, load_env_class
+except ImportError:
+    from train_franka_ppo import build_env, load_env_class
+
 
 def main():
     parser = argparse.ArgumentParser(description="Visualised PPO policy rollout for Franka")
@@ -64,6 +69,9 @@ def main():
                         help="Experiment name matching the training run")
     parser.add_argument("--ckpt", type=int, default=None,
                         help="Checkpoint iteration (e.g. 500). Defaults to latest.")
+    parser.add_argument("--env", type=str, default=None,
+                        help="Environment module; defaults to saved env_cfg.pkl, then env_franka_parallel")
+    parser.add_argument("--mix", action="store_true", help="Evaluate both signs of the relative Z target")
     parser.add_argument("--no-vis", dest="vis", action="store_false", default=True,
                         help="Disable interactive viewer (headless)")
     parser.add_argument("--record", action="store_true", default=False,
@@ -104,8 +112,18 @@ def main():
     log_dir = f"logs/{args.exp_name}"
     env_cls = FrankaEnvParallel
     if args.use_2h:
+        if args.env:
+            parser.error("--env and --2H are mutually exclusive")
         env_cls = FrankaEnvParallel2H
         log_dir = f"{log_dir}-2H-control"
+    else:
+        env_spec = args.env
+        env_cfg_path = os.path.join(log_dir, "env_cfg.pkl")
+        if env_spec is None and os.path.isfile(env_cfg_path):
+            with open(env_cfg_path, "rb") as f:
+                env_spec = pickle.load(f).get("env")
+        if env_spec:
+            env_cls = load_env_class(env_spec)
 
     # ---- resolve checkpoint -----------------------------------------------
     if args.ckpt is not None:
@@ -128,7 +146,7 @@ def main():
     # record=True tells the env to add the camera BEFORE scene.build()
     obs_cls = env_cls
 
-    env = env_cls(
+    env = build_env(env_cls, dict(
         num_envs=1,
         vis=args.vis,
         record=args.record,
@@ -136,10 +154,13 @@ def main():
         target_dt=args.target_dt,
         limit_regrasp=args.limit_regrasp,
         solid_up=args.negative,
+        mix=args.mix,
         normalize=args.normalization,
         randomize=args.randomize,
         control_error=args.control_error,
-    )
+        zero=args.zero if getattr(env_cls, "HANDLES_ZERO_HOLD", False) else False,
+    ))
+    legacy_zero_hold = args.zero and not getattr(env, "HANDLES_ZERO_HOLD", False)
 
     # ---- load policy ------------------------------------------------------
     runner = OnPolicyRunner(env, train_cfg, log_dir, device=gs.device)
@@ -155,12 +176,14 @@ def main():
         "jerk_penalty", "z_acc_penalty", "ee_z_penalty",
         "regrasp_bonus", "no_regrasp_penalty",
     )
+    REWARD_PART_KEYS = getattr(env, "REWARD_PLOT_KEYS", REWARD_PART_KEYS)
     REGRASP_PLOT_KEYS = ("z_improvement", "regrasp_bonus")
-    ROLLOUT_TERM_KEYS = tuple(dict.fromkeys((*REWARD_PART_KEYS, *REGRASP_PLOT_KEYS)))
+    EFFORT_KEYS = ("peak_acceleration", "peak_torque_ratio", "torque_cost") if hasattr(env, "REWARD_VERSION") else ()
+    ROLLOUT_TERM_KEYS = tuple(dict.fromkeys((*REWARD_PART_KEYS, *REGRASP_PLOT_KEYS, *EFFORT_KEYS)))
 
     def _obs_scale_for(obs: torch.Tensor) -> torch.Tensor:
         """Return fixed normalization scales aligned to the active observation width."""
-        scale = torch.tensor(FrankaEnvParallel.OBS_SCALE, device=obs.device, dtype=obs.dtype)
+        scale = torch.tensor(obs_cls.OBS_SCALE, device=obs.device, dtype=obs.dtype)
         obs_dim = obs.shape[-1]
         if scale.numel() == obs_dim:
             return scale
@@ -369,11 +392,36 @@ def main():
         plt.close(fig)
         print(f"  [PLOT] regrasp  → {path}")
 
+    def _plot_effort(bufs, release_spans, ep_idx, save_dir):
+        """Show physics-step peaks; policy-rate differences can hide spikes."""
+        fig, axes = plt.subplots(3, 1, figsize=(12, 9), sharex=True)
+        panels = (
+            ("peak_acceleration", "Peak EE acceleration norm [m/s²]", env.Z_ACC_MAX),
+            ("peak_torque_ratio", "Peak arm torque / joint limit", 1.0),
+            ("torque_cost", "Mean squared normalized arm torque", None),
+        )
+        for ax, (key, label, limit) in zip(axes, panels):
+            ax.plot(bufs["steps"], bufs[key], label=label)
+            if limit is not None:
+                ax.axhline(limit, color="C3", linestyle="--", label="limit")
+            _shade_releases(ax, release_spans)
+            ax.set_ylabel(label)
+            ax.legend(fontsize=8)
+            ax.grid(alpha=0.3)
+        axes[-1].set_xlabel("High-level step")
+        fig.tight_layout()
+        path = os.path.join(save_dir, f"ep_{ep_idx:03d}_effort.png")
+        fig.savefig(path, dpi=120)
+        plt.close(fig)
+        print(f"  [PLOT] effort    → {path}")
+
     def _save_all_plots(bufs, release_spans, ep_idx, save_dir):
         _plot_episode(bufs, release_spans, ep_idx, save_dir)
         _plot_motion(bufs, release_spans, ep_idx, save_dir)
         _plot_reward_parts(bufs, release_spans, ep_idx, save_dir)
         _plot_regrasp(bufs, release_spans, ep_idx, save_dir)
+        if EFFORT_KEYS:
+            _plot_effort(bufs, release_spans, ep_idx, save_dir)
 
     def _append_rollout_sample(bufs, obs, env, step_idx, reward_value, reward_terms, target_z, actual_z_acc):
         """
@@ -471,7 +519,7 @@ def main():
 
                 actions = policy(obs_td)
                 pulse_steps_before = None
-                if args.zero:
+                if legacy_zero_hold:
                     policy_z_vel = actions[0, 0].item() * env.Z_VEL_MAX
                     if policy_z_vel > 1e-4:
                         policy_z_vel_sign = 1
@@ -581,7 +629,7 @@ def main():
                     wait_for_post_pulse_direction_change = False
                     prev_policy_z_vel_sign = 0
 
-                elif args.zero and pulse_steps_before == 1:
+                elif legacy_zero_hold and pulse_steps_before == 1:
                     wait_for_post_pulse_direction_change = True
 
                 if (not reset_buf[0].item()) and i % 100 == 0:
@@ -615,13 +663,14 @@ def main():
 
     except KeyboardInterrupt:
         print("\nStopped by user.")
-        # plot whatever episode data was collected so far
-        if args.plot and bufs["steps"]:
-            if _in_release:
-                release_spans.append((_release_start, ep_len))
-            ep_count += 1
-            _save_all_plots(bufs, release_spans, ep_count,
-                            save_dir=os.path.join(log_dir, "plots"))
+
+    # Also save an unfinished episode when --steps ends the rollout normally.
+    if args.plot and bufs["steps"]:
+        if _in_release:
+            release_spans.append((_release_start, ep_len))
+        ep_count += 1
+        _save_all_plots(bufs, release_spans, ep_count,
+                        save_dir=os.path.join(log_dir, "plots"))
 
     if args.record and env.cam is not None:
         env.cam.stop_recording(save_to_filename="franka_policy.mp4", fps=60)

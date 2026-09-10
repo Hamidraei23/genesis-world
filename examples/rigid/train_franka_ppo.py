@@ -23,7 +23,6 @@ import importlib
 import inspect
 import os
 import pickle
-import shutil
 import sys
 from importlib import metadata
 from pathlib import Path
@@ -116,6 +115,129 @@ def build_env(env_cls, kwargs: dict):
 
 
 # ---------------------------------------------------------------------------
+# Per-iteration reward table
+# ---------------------------------------------------------------------------
+
+# (column header, extras["episode"] key, format spec)
+TABLE_COLUMNS = (
+    ("total",   "rew_total",       "{:>9.1f}"),
+    ("base",    "rew_base",        "{:>9.1f}"),
+    ("regrasp", "rew_regrasp",     "{:>9.1f}"),
+    ("dwell",   "rew_dwell",       "{:>8.2f}"),
+    ("attempt", "rew_attempt",     "{:>8.2f}"),
+    ("progress", "rew_progress",   "{:>9.2f}"),
+    ("torque",  "rew_torque",      "{:>8.2f}"),
+    ("accel",   "rew_acceleration", "{:>8.2f}"),
+    ("gravity", "rew_gravity",     "{:>8.2f}"),
+    ("jerk",    "rew_jerk",        "{:>8.2f}"),
+    ("speed",   "rew_speed",       "{:>8.2f}"),
+    ("hold",    "rew_hold",        "{:>8.2f}"),
+    ("wspace",  "rew_workspace",   "{:>8.2f}"),
+    ("grip",    "rew_grip",        "{:>8.2f}"),
+    ("succ%",   "outcome_success", "{:>6.1f}"),
+    ("fail%",   "outcome_fail",    "{:>6.1f}"),
+    ("tout%",   "outcome_timeout", "{:>6.1f}"),
+    ("grasps",  "regrasp_count",   "{:>7.2f}"),
+    ("dz_mm",   "z_improve_mm",    "{:>7.2f}"),
+    ("len",     "ep_len",          "{:>6.1f}"),
+    ("eps",     "n_episodes",      "{:>5.0f}"),
+)
+PERCENT_KEYS = {"outcome_success", "outcome_fail", "outcome_timeout"}
+# Environments may publish a fail_<cause> rate per terminal condition. They are
+# summarised under the table instead of widening it.
+FAIL_CAUSE_PREFIX = "fail_"
+
+
+def _mean_episode_extras(ep_extras: list) -> dict | None:
+    """
+    Average the per-step episode-info dicts rsl_rl collected this iteration.
+
+    Each dict holds the mean over the envs that terminated on that step, so the
+    dicts cover different numbers of episodes; weight them by 'n_episodes' to get
+    a true per-episode mean rather than rsl_rl's mean-of-means.
+    """
+    if not ep_extras:
+        return None
+    causes = {k for info in ep_extras for k in info if k.startswith(FAIL_CAUSE_PREFIX)}
+    means = {}
+    for key in [key for _, key, _ in TABLE_COLUMNS] + sorted(causes):
+        total = weight = 0.0
+        for info in ep_extras:
+            if key not in info:
+                continue
+            n = float(info.get("n_episodes", 1.0))
+            total += float(info[key]) * n
+            weight += n
+        if weight:
+            # 'eps' is a tally of the episodes behind the row, not an average
+            means[key] = weight if key == "n_episodes" else total / weight
+    return means or None
+
+
+def _render_reward_table(history: list) -> str:
+    """Render the collected rows as a fixed-width table, newest last."""
+    header = "  iter |" + "|".join(f"{name:>{len(fmt.format(0.0))}}"
+                                   for name, _, fmt in TABLE_COLUMNS)
+    rule = "-" * len(header)
+    lines = [
+        "",
+        " reward terms — mean per episode finished during the iteration",
+        rule,
+        header,
+        rule,
+    ]
+    for it, means in history:
+        cells = []
+        for _, key, fmt in TABLE_COLUMNS:
+            if key not in means:
+                cells.append(" " * len(fmt.format(0.0)))
+                continue
+            value = means[key] * 100.0 if key in PERCENT_KEYS else means[key]
+            cells.append(fmt.format(value))
+        lines.append(f"{it:>6d} |" + "|".join(cells))
+    lines.append(rule)
+    lines.append(_render_fail_causes(history[-1][1]) if history else "")
+    return "\n".join(lines) + "\n"
+
+
+def _render_fail_causes(means: dict) -> str:
+    """Name the terminal conditions behind the newest row's failures."""
+    causes = sorted(
+        ((k[len(FAIL_CAUSE_PREFIX):], v) for k, v in means.items()
+         if k.startswith(FAIL_CAUSE_PREFIX) and v > 0.0005),
+        key=lambda item: -item[1],
+    )
+    if not causes:
+        return ""
+    return " fail causes: " + " | ".join(f"{name} {rate * 100:.0f}%" for name, rate in causes)
+
+
+def install_reward_table(runner, rows_shown: int = 15) -> None:
+    """
+    Print a per-iteration reward/penalty table after each rsl_rl log block.
+
+    Wraps Logger.log because the episode extras it aggregates are cleared at the
+    end of every call. The verbose per-key "Mean episode ..." lines are suppressed
+    (print_minimal) since the table shows the same numbers.
+    """
+    logger = runner.logger
+    original_log = logger.log
+    history: list = []
+
+    def log_with_table(*args, **kwargs):
+        means = _mean_episode_extras(logger.ep_extras)
+        kwargs["print_minimal"] = True
+        original_log(*args, **kwargs)
+        if means is not None:
+            it = kwargs["it"] if "it" in kwargs else args[0]
+            history.append((it, means))
+            del history[:-rows_shown]
+            print(_render_reward_table(history))
+
+    logger.log = log_with_table
+
+
+# ---------------------------------------------------------------------------
 # Config
 # ---------------------------------------------------------------------------
 
@@ -182,6 +304,8 @@ def main():
     parser.add_argument("--seed", type=int, default=1)
     parser.add_argument("--resume", type=str, default=None,
                         help="Path to a checkpoint .pt file to resume training from")
+    parser.add_argument("--warm-start", type=str, default=None,
+                        help="Load only actor weights; start a fresh critic, optimizer and iteration counter")
     parser.add_argument("--dt", type=float, default=0.001,
                         help="Physics sim timestep (seconds)")
     parser.add_argument("--target_dt", type=float, default=0.02,
@@ -205,7 +329,14 @@ def main():
                         help="Enable post-pulse zero-z-velocity + close-gripper hold inside the environment")
     parser.add_argument("--control-error", action="store_true",
                         help="Add per-episode constant z-velocity command bias sampled in [-0.05, -0.03] U [0.03, 0.05]")
+    parser.add_argument("--minimze_vel", dest="minimize_vel", action="store_true",
+                        help="Enable a per-step linear penalty on |commanded z-velocity| (encourages minimal motion)")
+    parser.add_argument("--no-reward-table", dest="reward_table", action="store_false",
+                        help="Disable the per-iteration reward/penalty table and print rsl_rl's episode lines instead")
     args = parser.parse_args()
+
+    if args.resume and args.warm_start:
+        parser.error("--resume and --warm-start are mutually exclusive")
 
     if args.randomize_at is not None:
         if args.randomize:
@@ -220,11 +351,14 @@ def main():
 
     log_dir = f"logs/{args.exp_name}"
     train_cfg = get_train_cfg(args.exp_name)
+    if getattr(env_cls, "REWARD_GAMMA", train_cfg["algorithm"]["gamma"]) != train_cfg["algorithm"]["gamma"]:
+        raise ValueError("Environment potential-shaping discount must match PPO gamma")
 
-    # Fresh run: wipe old logs; resume: keep them
+    # Refuse accidental deletion of a previous experiment or source checkpoint.
+    # New rewards should use a distinct experiment name.
     if args.resume is None:
         if os.path.exists(log_dir):
-            shutil.rmtree(log_dir)
+            raise FileExistsError(f"Experiment already exists: {log_dir}. Choose a new -e name or use --resume.")
     os.makedirs(log_dir, exist_ok=True)
 
     with open(f"{log_dir}/train_cfg.pkl", "wb") as f:
@@ -241,6 +375,7 @@ def main():
             "randomize_at": args.randomize_at,
             "zero": args.zero,
             "control_error": args.control_error,
+            "minimize_vel": args.minimize_vel,
             "limit_regrasp": args.limit_regrasp,
             "solid_up": args.negative,
             "dt": args.dt,
@@ -269,14 +404,31 @@ def main():
             normalize=args.normalization,
             zero=args.zero,
             control_error=args.control_error,
+            minimize_vel=args.minimize_vel,
         ),
     )
 
     runner = OnPolicyRunner(env, train_cfg, log_dir, device=gs.device)
 
+    # Reward-term annealing reads the live PPO iteration, so it stays correct
+    # across --resume and the two-phase --randomize-at run. Without a source the
+    # environment uses its fully annealed weights, which is what replay wants.
+    if hasattr(env, "set_reward_iteration_source"):
+        env.set_reward_iteration_source(lambda: runner.current_learning_iteration)
+        print(
+            f"Reward annealing follows PPO iterations "
+            f"{env.EFFORT_ANNEAL_START_ITER}-{env.EFFORT_ANNEAL_END_ITER}"
+        )
+
+    if args.reward_table:
+        install_reward_table(runner)
+
     if args.resume is not None:
         runner.load(args.resume)
         print(f"Resumed from checkpoint: {args.resume}")
+    elif args.warm_start is not None:
+        runner.load(args.warm_start, load_cfg={"actor": True})
+        print(f"Loaded actor from {args.warm_start}; critic and optimizer start fresh")
 
     if args.randomize_at is None:
         runner.learn(num_learning_iterations=args.max_iterations, init_at_random_ep_len=True)

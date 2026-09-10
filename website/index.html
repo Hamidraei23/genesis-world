@@ -1,0 +1,142 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="description" content="Explore the Franka Emika Panda in an interactive robot playground by Hamidreza Raei.">
+  <title>Franka Playground · Hamidreza Raei</title>
+  <link rel="icon" href="data:,">
+  <style>
+    :root { color-scheme: dark; --bg:#171a23; --panel:#202430; --line:#363d4b; --text:#e8edf3; --muted:#a1adbd; --cyan:#71e6e1; }
+    * { box-sizing:border-box; }
+    body { margin:0; background:var(--bg); color:var(--text); font:15px/1.6 system-ui,sans-serif; }
+    a { color:var(--cyan); text-decoration:none; }
+    a:hover { text-decoration:underline; }
+    button, input, select { font:inherit; }
+    button, select { color:var(--text); background:#2a303e; border:1px solid var(--line); border-radius:7px; padding:7px 11px; cursor:pointer; }
+    button:hover, button[aria-pressed="true"] { border-color:var(--cyan); background:#233f47; }
+    button:disabled { opacity:.45; cursor:wait; }
+    :focus-visible { outline:2px solid var(--cyan); outline-offset:4px; }
+    .masthead { border-bottom:1px solid var(--line); padding:20px max(24px,calc((100vw - 1400px)/2)); display:flex; align-items:center; justify-content:space-between; }
+    .brand { color:var(--text); font-weight:650; letter-spacing:-.4px; }
+    .brand span { color:var(--cyan); margin-right:9px; font-family:monospace; }
+    .back { color:var(--muted); font-size:13px; }
+    main { max-width:1450px; margin:auto; padding:36px 25px 24px; }
+    .intro { display:flex; justify-content:space-between; align-items:center; gap:24px; margin-bottom:28px; }
+    .eyebrow { color:var(--cyan); font:11px/1.5 ui-monospace,monospace; letter-spacing:2px; text-transform:uppercase; }
+    h1 { font-size:clamp(30px,3.5vw,46px); letter-spacing:-1.8px; font-weight:600; line-height:1.2; margin:8px 0 10px; }
+    .intro p { margin:0; color:var(--muted); max-width:650px; }
+    .badge { white-space:nowrap; color:var(--cyan); border:1px solid #3e6266; border-radius:30px; padding:6px 12px; font:11px ui-monospace,monospace; }
+    .workbench { display:grid; grid-template-columns:minmax(0,1fr) 310px; border:1px solid var(--line); border-radius:12px; overflow:hidden; background:var(--panel); }
+    .viewport { position:relative; min-height:685px; background:#171e29; overflow:hidden; }
+    #canvas-host { position:absolute; inset:0; }
+    canvas { display:block; width:100%; height:100%; touch-action:none; }
+    .scene-top { position:absolute; top:20px; left:22px; right:20px; display:flex; justify-content:space-between; align-items:start; pointer-events:none; }
+    .scene-name { font-size:12px; color:#bdc9d9; letter-spacing:.4px; }
+    .scene-name small { display:block; color:#7f91a7; font:10px ui-monospace,monospace; margin-top:3px; }
+    .scene-top button { pointer-events:auto; background:#1b2433cc; font-size:12px; }
+    .scene-bottom { position:absolute; bottom:18px; left:22px; right:22px; display:flex; align-items:end; justify-content:space-between; gap:12px; pointer-events:none; }
+    .hint { font-size:11px; color:#a0b1c7; background:#17202be6; padding:7px 10px; border-radius:5px; }
+    .view-buttons { display:flex; gap:5px; pointer-events:auto; }
+    .view-buttons button { font:11px ui-monospace,monospace; background:#1b2433dd; }
+    #load-status { position:absolute; top:72px; left:22px; max-width:85%; font:12px ui-monospace,monospace; color:var(--cyan); background:#17202be6; padding:8px 10px; border-radius:5px; }
+    #load-status[data-error="true"] { color:#ffb2a8; }
+    .sidebar { padding:23px; border-left:1px solid var(--line); }
+    .panel-heading { display:flex; align-items:center; justify-content:space-between; margin-bottom:16px; }
+    h2 { font-size:14px; font-weight:600; margin:0; }
+    .panel-heading span { color:var(--muted); font:10px ui-monospace,monospace; }
+    .preset-row { display:flex; gap:8px; margin-bottom:22px; }
+    .preset-row button { flex:1; font-size:12px; }
+    .joint { margin:0 0 12px; }
+    .joint label { display:flex; align-items:center; justify-content:space-between; color:#bbc5d4; font-size:12px; }
+    .joint output { color:var(--cyan); font:11px ui-monospace,monospace; }
+    .joint-entry { display:flex; align-items:center; gap:10px; }
+    input[type="number"] { min-width:0; width:90px; color:var(--text); background:#171e29; border:1px solid var(--line); border-radius:5px; padding:5px 6px; font:11px ui-monospace,monospace; }
+    #angle-unit { font-size:11px; padding:4px 7px; }
+    .control-tabs { display:flex; gap:8px; margin-bottom:18px; }
+    .control-tabs button { flex:1; font-size:12px; }
+    .control-tabs [aria-selected="true"] { color:var(--cyan); border-color:var(--cyan); }
+    .control-help, #ik-status { font-size:11px; color:var(--muted); margin:10px 0; }
+    #ik-status[data-error="true"] { color:#ffb2a8; }
+    .cart-row { display:flex; align-items:center; gap:8px; margin:12px 0; }
+    .cart-row label { flex:1; font:12px ui-monospace,monospace; }
+    .cart-row input { width:100px; }
+    .cart-row button { padding:4px 9px; }
+    .cart-option { display:flex; align-items:center; gap:8px; font-size:12px; margin:12px 0; }
+    .sidebar { max-height:770px; overflow-y:auto; scrollbar-width:thin; }
+    input[type="range"] { width:100%; height:16px; margin:6px 0 0; accent-color:var(--cyan); cursor:pointer; }
+    input[type="checkbox"] { accent-color:var(--cyan); width:15px; height:15px; }
+    fieldset { border:0; padding:0; margin:0; min-width:0; }
+    .divider { border:0; border-top:1px solid var(--line); margin:19px 0; }
+    .toggles { display:grid; grid-template-columns:1fr 1fr; gap:8px 12px; margin-top:12px; }
+    .toggles label { display:flex; align-items:center; gap:5px; font-size:12px; color:#bbc5d4; }
+    .readout { border-top:1px solid var(--line); padding:14px 22px; display:flex; flex-wrap:wrap; align-items:center; gap:12px 28px; background:#1c212c; }
+    .readout .label { font:10px ui-monospace,monospace; letter-spacing:1px; color:var(--muted); }
+    .readout output { font:12px ui-monospace,monospace; }
+    .readout .state { margin-left:auto; color:var(--cyan); font:11px ui-monospace,monospace; }
+    .notes { display:grid; grid-template-columns:1.2fr 1fr 1fr; gap:40px; padding:30px 0; }
+    .notes h3 { font-size:13px; margin:0 0 8px; font-weight:550; }
+    .notes p { font-size:12px; color:var(--muted); margin:0; }
+    footer { display:flex; justify-content:space-between; border-top:1px solid var(--line); padding-top:18px; color:var(--muted); font-size:11px; gap:20px; }
+    .embed .masthead, .embed .intro, .embed .notes, .embed footer { display:none; }
+    .embed main { padding:0; max-width:none; }
+    .embed .workbench { border-radius:0; }
+    .viewport:fullscreen { width:100vw; height:100vh; }
+    @media(max-width:850px) { .workbench { grid-template-columns:minmax(0,1fr) 270px; } .sidebar { padding:18px; } .badge { display:none; } .hint { max-width:155px; } .scene-bottom { left:12px; right:12px; } }
+    @media(max-width:650px) { main { padding:25px 14px; } .masthead { padding:17px; } .workbench { grid-template-columns:1fr; } .viewport { min-height:450px; } .sidebar { border-left:0; border-top:1px solid var(--line); } .notes { grid-template-columns:1fr; gap:18px; } .readout { gap:12px; } .readout .state { margin-left:0; } footer { flex-wrap:wrap; } }
+  </style>
+</head>
+<body>
+  <header class="masthead"><a class="brand" href="../../"><span>&gt;_</span> Hamidreza Raei</a><a class="back" href="../../#robot-playground">← Back to portfolio</a></header>
+  <main>
+    <div class="intro"><div><div class="eyebrow">Robotics lab / Interactive notes 01</div><h1>Meet the Franka Panda.</h1><p>Seven joints. Endless perspectives. Explore the arm, adjust its pose, and take a closer look at the robot behind the research.</p></div><span class="badge">INTERACTIVE 3D</span></div>
+    <div class="workbench">
+      <section class="viewport" aria-label="Interactive 3D Franka robot">
+        <div id="canvas-host"></div>
+        <div class="scene-top"><div class="scene-name">FRANKA EMIKA · PANDA<small>7-AXIS ARM / PARALLEL GRIPPER</small></div><button id="fullscreen" title="Expand the 3D view">⛶ Expand</button></div>
+        <div id="load-status" role="status" aria-live="polite">Loading robot assets…</div>
+        <div class="scene-bottom"><span class="hint">Drag to orbit · Scroll to zoom<br>Right-drag to pan · Touch supported</span><div class="view-buttons" aria-label="Camera presets"><button data-view="perspective" aria-pressed="true">3D</button><button data-view="front" aria-pressed="false">Front</button><button data-view="side" aria-pressed="false">Side</button><button data-view="top" aria-pressed="false">Top</button></div></div>
+      </section>
+      <aside class="sidebar" aria-label="Robot controls">
+        <fieldset id="robot-controls" disabled>
+          <div class="panel-heading"><h2>Robot controls</h2><select id="angle-unit" aria-label="Angle units"><option value="degrees">Degrees °</option><option value="radians">Radians</option></select></div>
+          <div class="preset-row"><button id="home">↺ Home pose</button><button id="demo" aria-pressed="false">▷ Play demo</button></div>
+          <div class="control-tabs" role="tablist" aria-label="Control mode"><button id="joint-tab" role="tab" aria-controls="joint-panel" aria-selected="true">Joints</button><button id="cartesian-tab" role="tab" aria-controls="cartesian-panel" aria-selected="false" tabindex="-1">Cartesian EE</button></div>
+          <div id="joint-panel" role="tabpanel" aria-labelledby="joint-tab"><div id="joints"></div></div>
+          <div id="cartesian-panel" role="tabpanel" aria-labelledby="cartesian-tab" hidden>
+            <h2>End-effector target</h2>
+            <p class="control-help">Pose of the fingertip point, midway between the finger tips, in the robot base frame. Roll, pitch and yaw turn about that point. Drag the gizmo at the gripper, jog an axis, or enter a target.</p>
+            <div class="cart-row"><label for="target-x">X (m)</label><button data-jog="x:-1" aria-label="Decrease X">−</button><input id="target-x" type="number" step="0.001"><button data-jog="x:1" aria-label="Increase X">+</button></div>
+            <div class="cart-row"><label for="target-y">Y (m)</label><button data-jog="y:-1" aria-label="Decrease Y">−</button><input id="target-y" type="number" step="0.001"><button data-jog="y:1" aria-label="Increase Y">+</button></div>
+            <div class="cart-row"><label for="target-z">Z (m)</label><button data-jog="z:-1" aria-label="Decrease Z">−</button><input id="target-z" type="number" step="0.001"><button data-jog="z:1" aria-label="Increase Z">+</button></div>
+            <label class="cart-option" for="jog-step">Jog step <select id="jog-step"><option value="0.001">1 mm</option><option value="0.01" selected>1 cm</option><option value="0.05">5 cm</option></select></label>
+            <hr class="divider">
+            <div class="cart-row"><label for="target-roll">Roll <span data-angle-unit>&deg;</span></label><button data-rot="x:-1" aria-label="Decrease roll">&minus;</button><input id="target-roll" type="number" step="any"><button data-rot="x:1" aria-label="Increase roll">+</button></div>
+            <div class="cart-row"><label for="target-pitch">Pitch <span data-angle-unit>&deg;</span></label><button data-rot="y:-1" aria-label="Decrease pitch">&minus;</button><input id="target-pitch" type="number" step="any"><button data-rot="y:1" aria-label="Increase pitch">+</button></div>
+            <div class="cart-row"><label for="target-yaw">Yaw <span data-angle-unit>&deg;</span></label><button data-rot="z:-1" aria-label="Decrease yaw">&minus;</button><input id="target-yaw" type="number" step="any"><button data-rot="z:1" aria-label="Increase yaw">+</button></div>
+            <label class="cart-option" for="rot-step">Rotate step <select id="rot-step"><option value="1">1&deg;</option><option value="5" selected>5&deg;</option><option value="15">15&deg;</option></select></label>
+            <hr class="divider">
+            <label class="cart-option"><input id="lock-orientation" type="checkbox" checked>Keep gripper orientation</label>
+            <label class="cart-option"><input id="drag-ee" type="checkbox" checked>Show EE drag controls</label>
+            <label class="cart-option" for="drag-mode">Drag mode <select id="drag-mode"><option value="translate">Move (G)</option><option value="rotate">Rotate (R)</option></select></label>
+            <div class="preset-row"><button id="apply-target">Move to target</button><button id="sync-target">Use current EE</button></div>
+            <p id="ik-status" role="status" aria-live="polite">Target follows the current fingertip point.</p>
+            <p class="control-help">Kinematics only; no collision checking. If a target cannot be solved, the arm stays at its last valid pose.</p>
+          </div>
+          <hr class="divider">
+          <div class="joint"><label for="gripper">Gripper opening <output id="gripper-value" for="gripper">16.2 mm</output></label><input id="gripper" type="range" min="0" max="80" value="16.18" step="0.1"></div>
+          <hr class="divider">
+          <h2>Scene settings</h2>
+          <div class="toggles"><label><input id="grid" type="checkbox" checked>Floor grid</label><label><input id="axes" type="checkbox">Base axes</label><label><input id="wireframe" type="checkbox">Wireframe</label><label><input id="rotate" type="checkbox">Auto-orbit</label></div>
+        </fieldset>
+      </aside>
+    </div>
+    <div class="readout"><span class="label">FINGERTIP POINT · BASE FRAME</span><output id="tool-position">X — &nbsp; Y — &nbsp; Z —</output><span class="state" id="motion-state">● Preparing scene</span></div>
+    <div class="notes"><div><h3>A little closer to the research</h3><p>This Panda model comes from the Genesis repository. Its starting pose follows the parallel Franka environment used in the project.</p></div><div><h3>Make it move</h3><p>Use the sliders to explore each joint, or play a gentle motion demo. This is a kinematic viewer; poses are not checked for collisions.</p></div><div><h3>Made for the browser</h3><p>The robot, materials, and textures load locally. No ROS, simulator, or connection to a physical robot is needed.</p></div></div>
+    <footer><span>Hamidreza Raei · Robotics & interaction</span><span><a href="assets/panda/LICENSE.txt">Model license</a> · <a href="assets/vendor/THREE-LICENSE.txt">Three.js license</a> · <a href="assets/vendor/URDF-LOADER-NOTICE.md">URDF loader attribution</a></span></footer>
+  </main>
+  <noscript>This interactive robot viewer requires JavaScript. Enable it and reload this page.</noscript>
+  <script>if(new URLSearchParams(location.search).has('embed')) document.body.classList.add('embed');</script>
+  <script type="module" src="assets/vendor/viewer.js"></script>
+</body>
+</html>

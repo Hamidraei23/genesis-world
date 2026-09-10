@@ -1,0 +1,20 @@
+{
+  "name": "franka-blog-viewer",
+  "private": true,
+  "version": "1.0.0",
+  "type": "module",
+  "scripts": {
+    "prepare:model": "python3 scripts/prepare_model.py",
+    "build": "npm run prepare:model && node scripts/build.mjs && python3 scripts/export_site.py",
+    "start": "python3 -m http.server 8000 --bind 127.0.0.1",
+    "test": "playwright test"
+  },
+  "dependencies": {
+    "three": "0.185.1",
+    "urdf-loader": "0.13.1"
+  },
+  "devDependencies": {
+    "@playwright/test": "1.63.0",
+    "esbuild": "0.28.2"
+  }
+}

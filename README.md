@@ -168,6 +168,15 @@ the per-episode control-error bias and the ±15 m/s² acceleration clamp baked i
 - Row `i` is the reference at `(i + 1) × 0.02 s` (§3). `t = 0` is the instant the
   arm is holding still at the start pose with the bar gripped.
 
+**Publish at 1 kHz, not 50 Hz.** The CSV is a 50 Hz *waypoint* list; the sim
+never fed those rows to the IK. It expanded each 20 ms segment to 1 kHz with the
+cubic Hermite of §4.2 and low-passed it before the IK saw it. A controller that
+zero-order-holds the last message — yours does — turns a 50 Hz stream into a
+20 ms staircase instead. `franka_controllers/scripts/replay_traj_csv.py` does the
+expansion for you (`~interp:=hermite`, default, publishing at `~rate:=1000`);
+`~interp:=zoh` gives the 50 Hz staircase, which is how `policy.py` drives the
+robot today.
+
 **Send `target_z` as well if your controller keeps the position-error term.** The
 sim commands `v_cmd = v_ref + 8.0 · (target_z − ee_z)`
 ([env_franka_parallel.py:1197-1201](examples/rigid/env_franka_parallel.py#L1197-L1201)),
@@ -230,8 +239,11 @@ the arm path; it is not a replay of the task.
 
 5. **Check your acceleration headroom first** (§9). The reference asks for up to
    0.30 m/s of velocity change per 20 ms step; a Panda's 13 m/s² Cartesian limit
-   allows 0.26 m/s. Expect ~15% clipping on the sharpest steps unless you have
-   raised the limit, and know that the clipping lands on the reversal.
+   allows 0.26 m/s. This is not a rare corner: **29% of all steps across the 12
+   files exceed 13 m/s²** (23–47% depending on the file), and they are
+   concentrated on the velocity reversals inside the pulse windows — exactly the
+   part that produces the slip. `replay_traj_csv.py` slew-limits to 13 m/s² by
+   default and reports how many steps it touched.
 
 6. **Stop at the last row.** The episode ends the step the success test passes;
    there is no settle-out tail in the file.
