@@ -43,12 +43,14 @@ the scene is built once and the pulse pin is swapped between grid points,
 because the samplers re-read PULSE_* on every reset.
 
 Usage (inside the genesis container, from /workspace):
+    # default: one env, one successful episode, one CSV, desired_rel_z = +0.02,
+    # at the env's own PULSE_DELAY_STEPS / PULSE_LENGTH
     python3 examples/rigid/eval_pulse_grid_traj_franka.py \
         -e franka-lift-v1-student-ft3 --ckpt 1059
 
-    # exactly the 3x3 grid, 2 successful episodes per combination
+    # exactly the 3x3 grid, 2 successful episodes per combination, 64 envs for speed
     python3 examples/rigid/eval_pulse_grid_traj_franka.py \
-        -e franka-lift-v1-student-ft3 --ckpt 1059 \
+        -e franka-lift-v1-student-ft3 --ckpt 1059 -B 64 --max-steps 3000 \
         --delays 1 2 3 --lengths 3 4 5 --per-combo 2
 
     # watch one env in the viewer (and/or write an MP4 per combination)
@@ -66,6 +68,7 @@ import json
 import os
 import pickle
 import sys
+import time
 from pathlib import Path
 
 import numpy as np
@@ -87,6 +90,7 @@ from eval_test_franka_delays import (  # noqa: E402
     reseed,
     set_pulse,
 )
+from train_franka_ppo import build_env  # noqa: E402
 
 
 # Columns read off the env state each step (order matters: written as-is)
@@ -144,7 +148,9 @@ def state_row(env) -> np.ndarray:
         cuboid[:, 2], cuboid[:, 2] - finger_mid_z, env.desired_rel_z,
         grip_cmd[:, 0], grip_cmd[:, 1],
         fingers[:, 0], fingers[:, 1], (left_ft - right_ft).norm(dim=-1),
-        env._gripper_pulse_steps, env._zero_hold_countdown,
+        # Envs without a post-pulse zero-hold keep the column, filled with zeros.
+        env._gripper_pulse_steps,
+        getattr(env, "_zero_hold_countdown", torch.zeros_like(env._gripper_pulse_steps)),
     )
     return torch.stack([c.detach().float() for c in cols], dim=-1).cpu().numpy()
 
@@ -222,6 +228,7 @@ def run_combo(env, policy, pins: EnvPins, delay: int, length: int,
     ep_start = np.zeros(n_envs, dtype=int)
     saved: list[dict] = []
     outcomes = {"success": 0, "fail": 0, "timeout": 0}
+    t_start = time.perf_counter()
 
     for _ in range(args.max_steps):
         with torch.no_grad():
@@ -246,13 +253,25 @@ def run_combo(env, policy, pins: EnvPins, delay: int, length: int,
         pins.terminal.clear()
         rows.append(row)
 
+        # The rollout is otherwise silent until a success is saved or the budget runs out.
+        if args.progress_every and len(rows) % args.progress_every == 0:
+            elapsed = time.perf_counter() - t_start
+            rate = len(rows) / elapsed if elapsed > 0 else 0.0
+            print(f"    step {len(rows)}/{args.max_steps}  episodes ended: "
+                  f"{outcomes['success']} success, {outcomes['fail']} fail, "
+                  f"{outcomes['timeout']} timeout  |  {rate:.0f} policy steps/s, "
+                  f"{elapsed:.0f} s elapsed", flush=True)
+
         done_np = done.detach().cpu().numpy().astype(bool)
         if not done_np.any():
             continue
 
         terms = env.last_reward_terms
-        succ_np = (terms["success"] > 0).detach().cpu().numpy().astype(bool)
-        time_np = (terms["timeout"] > 0).detach().cpu().numpy().astype(bool)
+        # Newer envs publish episode outcomes as ep_success / ep_timeout.
+        succ_t = terms["ep_success"] if "ep_success" in terms else terms["success"]
+        time_t = terms["ep_timeout"] if "ep_timeout" in terms else terms["timeout"]
+        succ_np = (succ_t > 0).detach().cpu().numpy().astype(bool)
+        time_np = (time_t > 0).detach().cpu().numpy().astype(bool)
 
         for i in np.nonzero(done_np)[0]:
             if succ_np[i]:
@@ -308,19 +327,24 @@ def main():
                    help="Auto-selection: trailing-mean window in iterations")
     p.add_argument("--tag", type=str, default="Train/mean_reward",
                    help="Auto-selection: TensorBoard scalar to score by")
-    p.add_argument("--delays", nargs="+", type=int, default=[1, 2, 3],
-                   help="PULSE_DELAY_STEPS values to pin (steps of target_dt)")
-    p.add_argument("--lengths", nargs="+", type=int, default=[3, 4, 5, 6],
-                   help="PULSE_LENGTH values to pin (steps of target_dt)")
+    p.add_argument("--delays", nargs="+", type=int, default=None,
+                   help="PULSE_DELAY_STEPS values to pin (steps of target_dt). "
+                        "Default: the env's own PULSE_DELAY_STEPS, a single value")
+    p.add_argument("--lengths", nargs="+", type=int, default=None,
+                   help="PULSE_LENGTH values to pin (steps of target_dt). "
+                        "Default: the env's own PULSE_LENGTH, a single value")
     p.add_argument("--desired-rel-z", type=float, default=0.02,
                    help="Lift target in metres, pinned for every episode. "
                         "Positive = normal/up mode (not solid-up)")
     p.add_argument("--per-combo", type=int, default=1,
                    help="Successful episodes to save per combination")
-    p.add_argument("-B", "--num-envs", type=int, default=64)
-    p.add_argument("--max-steps", type=int, default=3000,
-                   help="Policy-step budget per combination")
+    p.add_argument("-B", "--num-envs", type=int, default=1,
+                   help="Parallel envs. Default 1: one env, so the CSV is that env's episode")
+    p.add_argument("--max-steps", type=int, default=10000,
+                   help="Policy-step budget per combination (one env needs many episodes)")
     p.add_argument("--seed", type=int, default=1)
+    p.add_argument("--progress-every", type=int, default=100,
+                   help="Print a progress line every N policy steps (0 = silent)")
     p.add_argument("--dt", type=float, default=0.001)
     p.add_argument("--target_dt", type=float, default=0.02)
     p.add_argument("--out-dir", type=str, default=None,
@@ -376,7 +400,9 @@ def main():
     ranges = capture_ranges(env_cls)
     print(f"Native pulse ranges: delay {ranges['delay']}  length {ranges['length']}")
 
-    env = env_cls(
+    # build_env drops options the env does not accept (e.g. zero / control_error on
+    # envs that no longer have them) and prints which ones it ignored.
+    env = build_env(env_cls, dict(
         num_envs=args.num_envs,
         vis=args.vis,
         record=args.record,   # adds the camera before scene.build()
@@ -388,7 +414,7 @@ def main():
         randomize=args.randomize,
         zero=args.zero,
         control_error=args.control_error,
-    )
+    ))
     pins = EnvPins(env, args.desired_rel_z)
     GripperCommandCapture(env)
 
@@ -396,6 +422,12 @@ def main():
     runner.load(ckpt_path)
     policy = runner.get_inference_policy(device=gs.device)
 
+    # Default to one grid point, the env's own fixed pulse timing, so a plain run
+    # writes exactly one CSV.
+    if args.delays is None:
+        args.delays = [int(env_cls.PULSE_DELAY_STEPS)]
+    if args.lengths is None:
+        args.lengths = [int(env_cls.PULSE_LENGTH)]
     grid = [(d, l) for d in args.delays for l in args.lengths]
     print(f"Grid: {len(grid)} combinations, desired_rel_z pinned to "
           f"{args.desired_rel_z:+.3f} m, {args.per_combo} trajectory/ies each")

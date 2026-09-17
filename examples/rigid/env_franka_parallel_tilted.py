@@ -1,13 +1,22 @@
-"""
-GPU-parallel FrankaEnv for RL training with Genesis.
+"""Franka regrasp with a configurable fixed grasp-axis tilt from 0 to 45 degrees.
 
-Key changes vs. env_franka.py (single-env):
-  - scene.build(n_envs=num_envs)          → N envs simulated in parallel on GPU
-  - all state: numpy (dim,) → torch (N, dim) on gs.device
-  - step(actions) accepts (N, action_dim) tensors
-  - reset(envs_idx) allows selective per-env reset
-  - controller fully vectorised with torch.linalg.solve (batched Jacobian)
-  - camera removed (not needed for training)
+``tilt_deg`` is inclination from world vertical, toward the pictured joint-5
+homing direction (approximately world +Y), not an absolute Euler pitch angle.
+The joint-5 rotation is calculated from forward kinematics. Zero reproduces the
+original joint home, object alignment, and world-coordinate task axes.
+
+All Z names refer to the fixed tilted grasp axis. Position coordinates are
+HOME_TASK_Z plus displacement along that axis from home. Observations, reward
+formulas, success/failure distances and hold targets use this same frame.
+The observation layout remains compatible with existing policies; the tilt is
+fixed for the run and is not an additional observation. Gravity stays world-down.
+Transverse and orientation feedback hold the line and home quaternion; axial
+position gain, action filter, reward weights and action scales are retained.
+
+Train:
+    python examples/rigid/train_franka_ppo.py --env env_franka_parallel_tilted --tilt-deg 20 -e franka-tilted20
+Preview:
+    python examples/rigid/env_franka_parallel_tilted.py -B 1 --vis --tilt-deg 45
 """
 
 import math
@@ -26,10 +35,11 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 # Torch-native helpers (Genesis's quat_to_rotvec is numpy-only)
 # ---------------------------------------------------------------------------
 
+
 def _tc_quat_to_rotvec(quat: torch.Tensor) -> torch.Tensor:
     """Angle-axis (rotvec) from quaternion (w, x, y, z). Supports any batch shape."""
-    q_w = quat[..., :1]           # (..., 1)
-    q_vec = quat[..., 1:]         # (..., 3)
+    q_w = quat[..., :1]  # (..., 1)
+    q_vec = quat[..., 1:]  # (..., 3)
     s2 = q_vec.norm(dim=-1, keepdim=True)
     angle = 2.0 * torch.atan2(s2, q_w.abs())
     inv_sinc = angle / s2.clamp(min=1e-8)
@@ -48,12 +58,15 @@ def _tc_quat_mul(u: torch.Tensor, v: torch.Tensor) -> torch.Tensor:
     """Hamilton product  u ⊗ v  for unit quaternions (w, x, y, z)."""
     uw, ux, uy, uz = u[..., 0], u[..., 1], u[..., 2], u[..., 3]
     vw, vx, vy, vz = v[..., 0], v[..., 1], v[..., 2], v[..., 3]
-    quat = torch.stack([
-        uw * vw - ux * vx - uy * vy - uz * vz,
-        uw * vx + ux * vw + uy * vz - uz * vy,
-        uw * vy - ux * vz + uy * vw + uz * vx,
-        uw * vz + ux * vy - uy * vx + uz * vw,
-    ], dim=-1)
+    quat = torch.stack(
+        [
+            uw * vw - ux * vx - uy * vy - uz * vz,
+            uw * vx + ux * vw + uy * vz - uz * vy,
+            uw * vy - ux * vz + uy * vw + uz * vx,
+            uw * vz + ux * vy - uy * vx + uz * vw,
+        ],
+        dim=-1,
+    )
     return quat / quat.norm(dim=-1, keepdim=True).clamp(min=1e-8)
 
 
@@ -61,9 +74,14 @@ def _tc_quat_mul(u: torch.Tensor, v: torch.Tensor) -> torch.Tensor:
 # Parallel Franka environment
 # ---------------------------------------------------------------------------
 
-class FrankaEnvParallel:
+
+class FrankaEnvParallelTilted:
     """
-    Vectorised Franka environment.
+    Vectorised tilted Franka environment.
+
+    Z is the fixed home grasp axis; it does not rotate with tracking errors.
+    EE positions use HOME_TASK_Z + displacement from home along that axis.
+    Cuboid relative X/Y/Z and EE velocities are projected into that same frame.
 
     Observations: flat tensor (N, OBS_DIM=10)
         [0]    ee_pos_z
@@ -76,7 +94,7 @@ class FrankaEnvParallel:
         [7]    cuboid_rel_x
         [8]    cuboid_rel_y
         [9]    desired_rel_z
-        
+
         Future Observations (To be added):
         [10]   last_pulse_gap_z_improve (LAST PULSE GAP z improvement)
         [11]   pulse_gap_duration (Duration of gap derived from finger pos)
@@ -87,18 +105,23 @@ class FrankaEnvParallel:
         [1:3] gripper_pos (left, right finger)
     """
 
+    DEFAULT_TILT_DEG = 30.0
+    HOME_ARM_Q = (0.0, -0.82, 0.0, -2.180, 0.0, 2.9, 0.78)
+    # Original environment's nominal FK hand height, retained as task origin value.
+    HOME_TASK_Z = 0.854586497
+
     # Observation layout constants
-    OBS_DIM            = 10
-    OBS_EE_POS_Z       = 0
-    OBS_EE_VEL_Z       = 1
-    OBS_TARGET_Z_VEL   = 2
-    OBS_TARGET_Z_ACC   = 3
+    OBS_DIM = 10
+    OBS_EE_POS_Z = 0
+    OBS_EE_VEL_Z = 1
+    OBS_TARGET_Z_VEL = 2
+    OBS_TARGET_Z_ACC = 3
     OBS_LEFT_FORCE_MAG = 4
     OBS_RIGHT_FORCE_MAG = 5
-    OBS_CUBOID_REL_Z   = 6
-    OBS_CUBOID_REL_X   = 7
-    OBS_CUBOID_REL_Y   = 8
-    OBS_DESIRED_REL_Z  = 9
+    OBS_CUBOID_REL_Z = 6
+    OBS_CUBOID_REL_X = 7
+    OBS_CUBOID_REL_Y = 8
+    OBS_DESIRED_REL_Z = 9
     # Future Observations (To be added):
     # OBS_LAST_PULSE_GAP_Z_IMPROVE = 10
     # OBS_PULSE_GAP_DURATION       = 11
@@ -113,54 +136,69 @@ class FrankaEnvParallel:
 
     # Weights applied to each additive reward component in _compute_done_and_reward.
     # Also read by reward_table.RewardTermTracker for the per-iteration table.
+    # Only the keys listed here are summed into rew_buf. jerk_penalty,
+    # vel_sign_flip_penalty and post_pulse_hold_penalty are still computed (their
+    # countdown side effects are needed) but no longer contribute; add a key back
+    # here and to last_reward_terms to re-enable one.
+    # base_reward carries the terminal signal (success payout, fail/timeout penalty,
+    # per-step alive cost). Without it the dense proximity term makes loitering near
+    # the target strictly better than finishing, so it stays in the sum.
     REWARD_TERM_WEIGHTS = {
         "base_reward": 1.0,
+        "proximity_reward": 1.0,
         "regrasp_bonus": 2.0,
-        "jerk_penalty": 1.0,
         "z_acc_penalty": 1.0,
-        "vel_sign_flip_penalty": 1.0,
-        "post_pulse_hold_penalty": 1.0,
     }
 
     # Action scaling constants
-    Z_VEL_MAX       = 0.45
-    Z_ACC_MAX       = 15.00   # m/s² — hard limit on target-velocity rate of change
+    Z_VEL_MAX = 0.45
+    Z_ACC_MAX = 15.00  # m/s² — hard limit on target-velocity rate of change
     Z_ACC_PENALTY_THRESHOLD = 5.0
-    Z_ACC_PENALTY_WEIGHT    = 2.0
-    EE_Z_TARGET     = 0.7
-    GRIPPER_CLOSED  = 0.000251
-    GRIPPER_OPEN    = 0.0127   # per finger; gap 25.4 mm clears the 25 mm block
+    Z_ACC_PENALTY_WEIGHT = 2.0
+    EE_Z_TARGET = 0.7
+    GRIPPER_CLOSED = 0.000251
+    GRIPPER_OPEN = 0.0130  # per finger; gap 26.0 mm clears the 25 mm block by 1.0 mm
     # Release-to-regrasp detection
     FORCE_FREE_THRESHOLD = 0.15  # N: avg finger force below this -> fully released
     REGRASP_FORCE_THRESHOLD = 0.75  # N: avg finger force at/above this -> firm grasp
     AMBIGUOUS_FORCE_PENALTY = 10.0
     FREE_FORCE_REWARD = 1.0
-    REGRASP_BONUS           = 75.0  # duration-weighted reward scale for successful regrasp events
-    REGRASP_TERMINATION_COUNT = 7   # fail on the 7th regrasp if not successful by then
-    REGRASP_BONUS_MAX_COUNT = 4     # regrasp bonus paid only for the first 4 regrasps
+    REGRASP_BONUS = 75.0  # duration-weighted reward scale for successful regrasp events
+    REGRASP_TERMINATION_COUNT = 7  # fail on the 7th regrasp if not successful by then
+    REGRASP_BONUS_MAX_COUNT = 4  # regrasp bonus paid only for the first 4 regrasps
     FIRM_GRASP_SLIP_PENALTY_WEIGHT = 30.0  # harsh penalty per (m/step)² of Z-slip during firm grasp
     SUCCESS_EE_Z_MIN = 0.7
     SUCCESS_EE_Z_MAX = 0.86
-    SUCCESS_EE_VEL_MAX = 0.05   # m/s: |ee_vel_z| must be below this to count as settled
+    SUCCESS_EE_VEL_MAX = 0.05  # m/s: |ee_vel_z| must be below this to count as settled
     # Terminal and per-step base reward. Failing must always cost more than surviving to
     # the timeout, otherwise ending an episode early is the cheapest outcome. The fail
     # penalty is derived from these in _compute_done_and_reward, so that stays true if
     # any of them or max_episode_length change.
-    SUCCESS_REWARD       = 3750.0   # +25 % over the previous 3000
-    SUCCESS_TIME_PENALTY = 0.5      # per episode step, subtracted from SUCCESS_REWARD
-    ALIVE_PENALTY        = 1.25     # per non-terminal step
-    TIMEOUT_PENALTY      = 250.0
-    FAIL_PENALTY_MARGIN  = 100.0    # fail = TIMEOUT + ALIVE * max_episode_length + margin
+    SUCCESS_REWARD = 3750.0  # +25 % over the previous 3000
+    SUCCESS_TIME_PENALTY = 0.5  # per episode step, subtracted from SUCCESS_REWARD
+    ALIVE_PENALTY = 1.25  # per non-terminal step
+    TIMEOUT_PENALTY = 250.0
+    FAIL_PENALTY_MARGIN = 100.0  # fail = TIMEOUT + ALIVE * max_episode_length + margin
     SUCCESS_REQUIRED_STEPS = 5
+    # Dense proximity reward on the grasp-axis gap to the commanded offset.
+    # r(d) = MAX * (exp(-K*d/RANGE) - exp(-K)) / (1 - exp(-K)), clamped to [0, MAX].
+    # Exponential in d, so it climbs steeply only near the target: MAX at d = 0,
+    # exactly 0 at d = RANGE, and clamped to 0 beyond it -- never negative.
+    # With the values below: 0 mm -> 20.0, 5 mm -> 12.1, 10 mm -> 7.3, 20 mm -> 2.6.
+    # Scaled so a full 450-step episode of loitering near the target returns roughly
+    # 475, well under SUCCESS_REWARD, leaving the terminal signal in charge.
+    PROXIMITY_REWARD_MAX = 20.0
+    PROXIMITY_REWARD_RANGE = 0.05  # m: gap at which the reward reaches zero
+    PROXIMITY_REWARD_SHARPNESS = 5.0  # K: larger = more concentrated near d = 0
     EE_HOLD_Z_TARGET = 0.8
     EE_HOLD_Z_TOLERANCE = 0.025
     EE_HOLD_VEL_TOLERANCE = 0.02
     EE_HOLD_REQUIRED_STEPS = 5
     EE_HOLD_ACC_THRESHOLD = 2.0
-    PULSE_DELAY_STEPS = 2   # target-period steps to wait before the open window begins
-    PULSE_DELAY_RANDOM_MIN = 1   # 20 ms
-    PULSE_DELAY_RANDOM_MAX = 2   # 40 ms
-    PULSE_LENGTH = 5   # steps: open window, then 1 close step, back to policy control
+    PULSE_DELAY_STEPS = 2  # target-period steps to wait before the open window begins
+    PULSE_DELAY_RANDOM_MIN = 1  # 20 ms
+    PULSE_DELAY_RANDOM_MAX = 2  # 40 ms
+    PULSE_LENGTH = 5  # steps: open window, then 1 close step, back to policy control
     # The policy keeps commanding "open" through the delay, so the object is released for
     # PULSE_DELAY + PULSE_LENGTH - 1 steps: 6 steps = 120 ms with the fixed values above.
     # Holding the randomised length at 5 and letting the delay pick 1 or 2 steps keeps the
@@ -168,37 +206,39 @@ class FrankaEnvParallel:
     PULSE_LENGTH_RANDOM_MIN = 5
     PULSE_LENGTH_RANDOM_MAX = 5
     # Pulse lockout: no new pulse may start until this long after the previous TRIGGER.
-    PULSE_START_MIN_STEPS = 50        # no pulse may fire in the first N steps of an episode
-    PULSE_LOCKOUT_DURATION = 1.2      # s since the trigger before another pulse may fire
+    PULSE_START_MIN_STEPS = 50  # no pulse may fire in the first N steps of an episode
+    PULSE_LOCKOUT_DURATION = 1.2  # s since the trigger before another pulse may fire
     # Commanded-velocity sign flip, charged at every step (not only in the lockout) and in
     # proportion to the size of the jump across zero: a 0.2 m/s flip costs 5, 0.8 m/s costs 20.
     VEL_SIGN_FLIP_PENALTY_PER_MPS = 25.0
     # Post-pulse hold penalty: after pulse completes, wait 0.5s, then penalise instability for 0.5s
     POST_PULSE_DELAY_DURATION = 0.5  # wait before evaluation window
-    POST_PULSE_HOLD_DURATION = 0.5   # seconds
-    POST_PULSE_HOLD_PENALTY_Z = 200.0    # per-step penalty weight for distance from target
+    POST_PULSE_HOLD_DURATION = 0.5  # seconds
+    POST_PULSE_HOLD_PENALTY_Z = 200.0  # per-step penalty weight for distance from target
     POST_PULSE_HOLD_PENALTY_VEL = 200.0  # per-step penalty weight for velocity excess
-    POST_PULSE_HOLD_Z_TARGET = 0.8   # desired ee_z during hold
-    POST_PULSE_HOLD_VEL_MAX = 0.03   # deadzone for velocity penalty
+    POST_PULSE_HOLD_Z_TARGET = 0.8  # desired ee_z during hold
+    POST_PULSE_HOLD_VEL_MAX = 0.03  # deadzone for velocity penalty
     FINGER_GAIN_RANDOM_MIN = 100.0
     FINGER_GAIN_RANDOM_MAX = 500.0
     # Friction domain randomisation: effective contact μ sampled each episode
-    FRICTION_BASE = 0.75   # sliding friction in the MJCF files (dominant value)
-    FRICTION_MIN  = 0.6   # minimum desired effective contact friction
-    FRICTION_MAX  = 0.90   # maximum desired effective contact friction
+    FRICTION_BASE = 0.75  # sliding friction in the MJCF files (dominant value)
+    FRICTION_MIN = 0.6  # minimum desired effective contact friction
+    FRICTION_MAX = 0.90  # maximum desired effective contact friction
 
     def __init__(
         self,
         num_envs: int = 1,
         *,
+        tilt_deg: float = DEFAULT_TILT_DEG,
         vis: bool = False,
         record: bool = False,
         dt: float = 0.001,
         target_dt: float = 0.02,
         gripper_pos_min: float = 0.000251,
-        gripper_pos_max: float = 0.0127,
+        gripper_pos_max: float = 0.0130,
         pos_gain: float = 8.0,
-        rot_gain: float = 4.0,
+        rot_gain: float = 40.0,
+        transverse_pos_gain: float = 80.0,
         jacobian_damping: float = 1e-4,
         limit_regrasp: bool = False,
         solid_up: bool = False,
@@ -206,6 +246,9 @@ class FrankaEnvParallel:
         randomize: bool = False,
         normalize: bool = False,
     ):
+        self.tilt_deg = float(tilt_deg)
+        if not math.isfinite(self.tilt_deg) or not 0.0 <= self.tilt_deg <= 45.0:
+            raise ValueError("tilt_deg must be a finite angle between 0 and 45 degrees")
         self.num_envs = num_envs
         self.device = gs.device
         self.dt = dt
@@ -221,6 +264,12 @@ class FrankaEnvParallel:
         self.normalize = normalize
         self.extras: dict = {}
         self.cfg = {
+            "environment": "env_franka_parallel_tilted",
+            "coordinate_frame": "fixed_home_grasp",
+            "tilt_deg": self.tilt_deg,
+            "home_task_z": self.HOME_TASK_Z,
+            "transverse_pos_gain": transverse_pos_gain,
+            "rot_gain": rot_gain,
             "num_envs": num_envs,
             "num_actions": 3,
             "obs_dim": self.OBS_DIM,
@@ -269,6 +318,7 @@ class FrankaEnvParallel:
         # Controller gains (scalar – same for all envs)
         self.pos_gain = pos_gain
         self.rot_gain = rot_gain
+        self.transverse_pos_gain = transverse_pos_gain
         # Jacobian regulariser: (6, 6), broadcast over batch in _control_once
         reg = jacobian_damping * torch.eye(6, device=self.device)
         self.jacobian_regularizer = reg  # (6, 6)
@@ -280,14 +330,14 @@ class FrankaEnvParallel:
         # Discretised via bilinear (Tustin) transform at the sim rate T=dt.   #
         # Runs at 1000 Hz inside _control_once().                              #
         # ------------------------------------------------------------------ #
-        _T   = self.dt
-        _k   = 2.0 / _T
-        _wn2 = 5625.0   # wn = 75 rad/s
-        _blin = 49.5    # 2 * zeta * wn, zeta = 0.33
-        _a0  = _k**2 + _blin * _k + _wn2
-        self._filt_b0 =  _wn2 / _a0
+        _T = self.dt
+        _k = 2.0 / _T
+        _wn2 = 5625.0  # wn = 75 rad/s
+        _blin = 49.5  # 2 * zeta * wn, zeta = 0.33
+        _a0 = _k**2 + _blin * _k + _wn2
+        self._filt_b0 = _wn2 / _a0
         self._filt_b1 = (2.0 * _wn2) / _a0
-        self._filt_b2 =  _wn2 / _a0
+        self._filt_b2 = _wn2 / _a0
         self._filt_a1 = (-2.0 * _k**2 + 2.0 * _wn2) / _a0  # signed: subtracted below
         self._filt_a2 = (_k**2 - _blin * _k + _wn2) / _a0  # signed: subtracted below
 
@@ -332,11 +382,13 @@ class FrankaEnvParallel:
         # Global geom index range for friction randomisation (franka + cuboid)
         # Both are built; their geom_start / n_geoms are valid after scene.build().
         _franka_geom_idx = torch.arange(
-            self.franka.geom_start, self.franka.geom_start + self.franka.n_geoms,
+            self.franka.geom_start,
+            self.franka.geom_start + self.franka.n_geoms,
             device=self.device,
         )
         _cuboid_geom_idx = torch.arange(
-            self.cuboid.geom_start, self.cuboid.geom_start + self.cuboid.n_geoms,
+            self.cuboid.geom_start,
+            self.cuboid.geom_start + self.cuboid.n_geoms,
             device=self.device,
         )
         self._contact_geoms_idx = torch.cat([_franka_geom_idx, _cuboid_geom_idx])  # (n_contact_geoms,)
@@ -347,13 +399,14 @@ class FrankaEnvParallel:
         self.motors_dof = torch.arange(7, device=self.device)
         self.fingers_dof = torch.arange(7, 9, device=self.device)
         self.q_home = torch.tensor(
-            [0.0, -0.82, 0.0, -2.180, 0.0, 2.9, 0.78, 0.008090, 0.008090],
+            [*self.HOME_ARM_Q, 0.008090, 0.008090],
             device=self.device,
         )  # (9,)
 
         self.left_finger = self.franka.get_link("left_finger")
         self.right_finger = self.franka.get_link("right_finger")
         self.ee_link = self.franka.get_link("hand")
+        self._configure_home_pose()
 
         # Fingertip offsets in local finger frame
         self.fingertip_local = torch.tensor([0.0, 0.0055, 0.0445], device=self.device)
@@ -377,10 +430,11 @@ class FrankaEnvParallel:
 
         # ---- robot pose ----
         q_home_batch = self.q_home.unsqueeze(0).expand(len(envs_idx), -1)  # (|idx|, 9)
-        self.franka.set_qpos(q_home_batch, envs_idx=envs_idx)
+        self.franka.set_qpos(q_home_batch, envs_idx=envs_idx, zero_velocity=True)
         self.franka.control_dofs_position(q_home_batch, envs_idx=envs_idx)
 
         # ---- cuboid ----
+        self._reset_task_frame(envs_idx)
         self._reset_cuboid_home_pose(envs_idx)
 
         # ---- controller state (only for selected envs) ----
@@ -429,10 +483,10 @@ class FrankaEnvParallel:
             self._prev_gripper_avg = torch.full((N,), self.gripper_pos_min.mean().item(), device=self.device)
             # Steps since the last pulse trigger. Gates the lockout; starts "expired" so the
             # first pulse can fire at once.
-            self._pulse_lockout_steps = max(
-                1, int(round(self.PULSE_LOCKOUT_DURATION / self.target_period)))
+            self._pulse_lockout_steps = max(1, int(round(self.PULSE_LOCKOUT_DURATION / self.target_period)))
             self._steps_since_pulse = torch.full(
-                (N,), self._pulse_lockout_steps + 1, dtype=torch.long, device=self.device)
+                (N,), self._pulse_lockout_steps + 1, dtype=torch.long, device=self.device
+            )
             # Post-pulse hold countdown: high-level steps remaining in the hold window
             _delay_hl_steps = max(1, int(round(self.POST_PULSE_DELAY_DURATION / self.target_period)))
             _hold_hl_steps = max(1, int(round(self.POST_PULSE_HOLD_DURATION / self.target_period)))
@@ -441,8 +495,8 @@ class FrankaEnvParallel:
             self._post_pulse_delay_countdown = torch.zeros(N, dtype=torch.long, device=self.device)
             self._post_pulse_hold_countdown = torch.zeros(N, dtype=torch.long, device=self.device)
             # Cubic-hermite segment state per env
-            self._seg_start = None   # (N, 3): (z, z_vel, z_acc)
-            self._seg_end = None     # (N, 3)
+            self._seg_start = None  # (N, 3): (z, z_vel, z_acc)
+            self._seg_end = None  # (N, 3)
             self._seg_t0 = torch.zeros(N, device=self.device)  # wall-time at segment start
 
         # Warmup first so ee_link.get_pos() is valid
@@ -451,27 +505,25 @@ class FrankaEnvParallel:
             self.franka.control_dofs_position(q_home_batch_all)
             self.scene.step()
 
-        # Read ee state after warmup
-        ee_pos = self.ee_link.get_pos()    # (N, 3)
-        ee_quat = self.ee_link.get_quat()  # (N, 4)
-
-        self.target_center[envs_idx] = ee_pos[envs_idx].clone()
-        self.target_quat[envs_idx] = ee_quat[envs_idx].clone()
-        self.target_z[envs_idx] = ee_pos[envs_idx, 2].clone()
+        self.target_center[envs_idx] = self.task_origin[envs_idx]
+        self.target_quat[envs_idx] = self.task_quat[envs_idx]
+        self.target_z[envs_idx] = self.HOME_TASK_Z
         self.target_z_vel[envs_idx] = 0.0
         self.target_z_acc[envs_idx] = 0.0
         self.prev_target_z_vel[envs_idx] = 0.0
         self.direction_change_count[envs_idx] = 0
         _n = len(envs_idx)
-        _mag = 0.01 + torch.rand(_n, device=self.device) * 0.01   # uniform in [0.01, 0.04]
+        _mag = 0.01 + torch.rand(_n, device=self.device) * 0.01  # uniform in [0.01, 0.04]
         # _mag = 0.0375
         if self.mix:
-            _sign = torch.where(torch.rand(_n, device=self.device) < 0.5,
-                                torch.ones(_n, device=self.device),
-                                torch.full((_n,), -1.0, device=self.device))
-            _mag = _sign * _mag   # randomly flip sign per env
+            _sign = torch.where(
+                torch.rand(_n, device=self.device) < 0.5,
+                torch.ones(_n, device=self.device),
+                torch.full((_n,), -1.0, device=self.device),
+            )
+            _mag = _sign * _mag  # randomly flip sign per env
         elif self.solid_up:
-            _mag = -_mag   # negative desired_rel_z → solid-up training regime
+            _mag = -_mag  # negative desired_rel_z → solid-up training regime
         self.desired_rel_z[envs_idx] = _mag
         self.episode_length_buf[envs_idx] = 0
         self._in_release[envs_idx] = False
@@ -544,8 +596,10 @@ class FrankaEnvParallel:
         # Limit acceleration: |Δv| ≤ Z_ACC_MAX * target_period
         max_dv = self.Z_ACC_MAX * self.target_period
         new_z_vel = new_z_vel.clamp(self.target_z_vel - max_dv, self.target_z_vel + max_dv)
-        gripper_raw = actions[:, 1:].clamp(-1.0, 1.0)                 # (N, 2)
-        gripper_pos = self.gripper_pos_min + (gripper_raw + 1.0) * 0.5 * (self.gripper_pos_max - self.gripper_pos_min)  # (N, 2)
+        gripper_raw = actions[:, 1:].clamp(-1.0, 1.0)  # (N, 2)
+        gripper_pos = self.gripper_pos_min + (gripper_raw + 1.0) * 0.5 * (
+            self.gripper_pos_max - self.gripper_pos_min
+        )  # (N, 2)
 
         # Gripper pulse: rising edge through midpoint →
         #   per-env pulse_delay steps of policy (delay),
@@ -557,13 +611,12 @@ class FrankaEnvParallel:
         # Done:          steps == 0                 → policy
         _pulse_start = self._gripper_pulse_lengths + self._gripper_pulse_delays
         _gp_mid = (self.gripper_pos_min + self.gripper_pos_max).mean() * 0.5  # scalar midpoint
-        _gp_avg = gripper_pos.mean(dim=-1)                                     # (N,)
+        _gp_avg = gripper_pos.mean(dim=-1)  # (N,)
         # A pulse is blocked while the lockout runs and during the opening steps of an
         # episode. The clamp below holds the fingers shut outside pulses, so neither
         # block can be sidestepped by commanding the gripper open directly.
-        _pulse_blocked = (
-            (self._steps_since_pulse < self._pulse_lockout_steps)
-            | (self.episode_length_buf < self.PULSE_START_MIN_STEPS)
+        _pulse_blocked = (self._steps_since_pulse < self._pulse_lockout_steps) | (
+            self.episode_length_buf < self.PULSE_START_MIN_STEPS
         )  # (N,)
         _rising = (
             (self._prev_gripper_avg < _gp_mid)
@@ -571,25 +624,22 @@ class FrankaEnvParallel:
             & (self._gripper_pulse_steps == 0)
             & (~_pulse_blocked)
         )  # (N,) rising-edge crossing, no active pulse, nothing blocking
-        self._gripper_pulse_steps = torch.where(
-            _rising, _pulse_start, self._gripper_pulse_steps
-        )
+        self._gripper_pulse_steps = torch.where(_rising, _pulse_start, self._gripper_pulse_steps)
         # Trigger restarts the clock the lockout and the magnified window both read.
         self._steps_since_pulse = torch.where(
             _rising, torch.zeros_like(self._steps_since_pulse), self._steps_since_pulse
         )
         _gp_max_b = self.gripper_pos_max.unsqueeze(0).expand(self.num_envs, -1)  # (N, 2)
         _gp_min_b = self.gripper_pos_min.unsqueeze(0).expand(self.num_envs, -1)  # (N, 2)
-        _in_open = (self._gripper_pulse_steps >= 2) & (
-            self._gripper_pulse_steps <= self._gripper_pulse_lengths
-        )
+        _in_open = (self._gripper_pulse_steps >= 2) & (self._gripper_pulse_steps <= self._gripper_pulse_lengths)
         _in_close = self._gripper_pulse_steps == 1
         # Clamp: whenever no pulse is running the fingers are held fully closed, whatever
         # the policy asks. The finger action is therefore only a pulse trigger: it can
         # neither open the gripper directly nor loosen the squeeze below full force.
         _locked_out = self._gripper_pulse_steps == 0  # (N,)
         gripper_pos = torch.where(
-            _in_open.unsqueeze(-1), _gp_max_b,
+            _in_open.unsqueeze(-1),
+            _gp_max_b,
             torch.where((_in_close | _locked_out).unsqueeze(-1), _gp_min_b, gripper_pos),
         )
         # Edge detection remembers the EFFECTIVE command, not the raw request. A policy that
@@ -631,7 +681,7 @@ class FrankaEnvParallel:
 
         for local_step in range(self.target_update_every):
             t = (self.sim_step + local_step) * self.dt
-            tz, tz_vel = self._sample_target_z(t)   # (N,), (N,)
+            tz, tz_vel = self._sample_target_z(t)  # (N,), (N,)
             self._control_once(tz, tz_vel)
             self.scene.step(
                 update_visualizer=update_visualizer,
@@ -656,44 +706,50 @@ class FrankaEnvParallel:
 
     def _update_obs_buf(self):
         """Compute observations and write into self.obs_buf."""
-        ee_pos = self.ee_link.get_pos()     # (N, 3)
-        ee_vel = self.ee_link.get_vel()     # (N, 3)
+        ee_pos = self.ee_link.get_pos()  # (N, 3)
+        ee_vel = self.ee_link.get_vel()  # (N, 3)
         cuboid_pos = self.cuboid.get_pos()  # (N, 3)
-        left_ft = self._fingertip_pos(self.left_finger)    # (N, 3)
+        left_ft = self._fingertip_pos(self.left_finger)  # (N, 3)
         right_ft = self._fingertip_pos(self.right_finger)  # (N, 3)
 
         link_forces = self.franka.get_links_net_contact_force()  # (N, n_links, 3)
-        left_force = link_forces[:, self.left_finger.idx_local, :]   # (N, 3)
+        left_force = link_forces[:, self.left_finger.idx_local, :]  # (N, 3)
         right_force = link_forces[:, self.right_finger.idx_local, :]  # (N, 3)
-        left_force_mag = left_force.norm(dim=-1, keepdim=True)    # (N, 1)
+        left_force_mag = left_force.norm(dim=-1, keepdim=True)  # (N, 1)
         right_force_mag = right_force.norm(dim=-1, keepdim=True)  # (N, 1)
 
         finger_mid = (left_ft + right_ft) / 2.0  # (N, 3)
+        cuboid_rel = self._world_vector_to_task(cuboid_pos - finger_mid)
+        ee_task_z = self._task_position_z(ee_pos)
+        ee_task_vel = self._world_vector_to_task(ee_vel)
         _noise_range = 0.003 if self.randomize else 0.0
         _N = self.num_envs
 
         def _unoise(shape):
             return (torch.rand(shape, device=self.device) * 2.0 - 1.0) * _noise_range
 
-        self.obs_buf = torch.cat([
-            ee_pos[:, 2:3]  + _unoise((_N, 1)),                                     # [0]    ee_pos_z
-            ee_vel[:, 2:3]  + _unoise((_N, 1)),                                     # [1]    ee_vel_z
-            self.target_z_vel.unsqueeze(-1),                                         # [2]    target_z_vel
-            self.target_z_acc.unsqueeze(-1),                                         # [3]    target_z_acc
-            left_force_mag,                                                          # [4]    left_force_mag
-            right_force_mag,                                                         # [5]    right_force_mag
-            (cuboid_pos[:, 2] - finger_mid[:, 2]).unsqueeze(-1) + _unoise((_N, 1)), # [6]    cuboid_rel_z
-            (cuboid_pos[:, 0] - finger_mid[:, 0]).unsqueeze(-1) + _unoise((_N, 1)), # [7]    cuboid_rel_x
-            (cuboid_pos[:, 1] - finger_mid[:, 1]).unsqueeze(-1) + _unoise((_N, 1)), # [8]    cuboid_rel_y
-            self.desired_rel_z.unsqueeze(-1),                                        # [9]    desired_rel_z
-            # TODO: Future observations to be appended here:
-            # [10] last_pulse_gap_z_improve: LAST PULSE GAP z improvement
-            # [11] pulse_gap_duration: duration of gap derived from finger pos
-            # [12] acc_drop_to_open_delay: delay (ms) from EE acceleration going below -10.0 to EE open (can be +/-)
-        ], dim=-1)  # (N, 10)
+        self.obs_buf = torch.cat(
+            [
+                ee_task_z.unsqueeze(-1) + _unoise((_N, 1)),  # [0]    ee_pos_z
+                ee_task_vel[:, 2:3] + _unoise((_N, 1)),  # [1]    ee_vel_z
+                self.target_z_vel.unsqueeze(-1),  # [2]    target_z_vel
+                self.target_z_acc.unsqueeze(-1),  # [3]    target_z_acc
+                left_force_mag,  # [4]    left_force_mag
+                right_force_mag,  # [5]    right_force_mag
+                cuboid_rel[:, 2:3] + _unoise((_N, 1)),  # [6]    cuboid_rel_z
+                cuboid_rel[:, 0:1] + _unoise((_N, 1)),  # [7]    cuboid_rel_x
+                cuboid_rel[:, 1:2] + _unoise((_N, 1)),  # [8]    cuboid_rel_y
+                self.desired_rel_z.unsqueeze(-1),  # [9]    desired_rel_z
+                # TODO: Future observations to be appended here:
+                # [10] last_pulse_gap_z_improve: LAST PULSE GAP z improvement
+                # [11] pulse_gap_duration: duration of gap derived from finger pos
+                # [12] acc_drop_to_open_delay: delay (ms) from EE acceleration going below -10.0 to EE open (can be +/-)
+            ],
+            dim=-1,
+        )  # (N, 10)
 
         if self.normalize:
-            if not hasattr(self, '_obs_scale_t'):
+            if not hasattr(self, "_obs_scale_t"):
                 self._obs_scale_t = torch.tensor(self.OBS_SCALE, device=self.device)
             self.obs_buf = self.obs_buf / self._obs_scale_t
 
@@ -716,11 +772,7 @@ class FrankaEnvParallel:
         Failing at step t costs ALIVE*(t-1) + F, timing out costs ALIVE*(L-1) + TIMEOUT.
         F > TIMEOUT + ALIVE*L makes the first larger for every t >= 1.
         """
-        return (
-            self.TIMEOUT_PENALTY
-            + self.ALIVE_PENALTY * self.max_episode_length
-            + self.FAIL_PENALTY_MARGIN
-        )
+        return self.TIMEOUT_PENALTY + self.ALIVE_PENALTY * self.max_episode_length + self.FAIL_PENALTY_MARGIN
 
     def _compute_done_and_reward(self) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """
@@ -734,27 +786,26 @@ class FrankaEnvParallel:
         that moves the cuboid closer to desired_rel_z is rewarded.
         Recommended gamma: 0.99 (terminal signal meaningful up to ~200 steps out).
         """
-        cuboid_pos = self.cuboid.get_pos()                          # (N, 3)
-        ee_pos = self.ee_link.get_pos()                             # (N, 3)
-        ee_vel = self.ee_link.get_vel()                             # (N, 3)
-        left_ft = self._fingertip_pos(self.left_finger)             # (N, 3)
-        right_ft = self._fingertip_pos(self.right_finger)           # (N, 3)
-        finger_mid = (left_ft + right_ft) / 2.0                    # (N, 3)
-        fingertip_dist = (left_ft - right_ft).norm(dim=-1)          # (N,)
+        cuboid_pos = self.cuboid.get_pos()  # (N, 3)
+        ee_pos = self.ee_link.get_pos()  # (N, 3)
+        ee_vel = self.ee_link.get_vel()  # (N, 3)
+        left_ft = self._fingertip_pos(self.left_finger)  # (N, 3)
+        right_ft = self._fingertip_pos(self.right_finger)  # (N, 3)
+        finger_mid = (left_ft + right_ft) / 2.0  # (N, 3)
+        fingertip_dist = (left_ft - right_ft).norm(dim=-1)  # (N,)
 
-        link_forces     = self.franka.get_links_net_contact_force()     # (N, n_links, 3)
-        left_force_mag  = link_forces[:, self.left_finger.idx_local,  :].norm(dim=-1)  # (N,)
+        link_forces = self.franka.get_links_net_contact_force()  # (N, n_links, 3)
+        left_force_mag = link_forces[:, self.left_finger.idx_local, :].norm(dim=-1)  # (N,)
         right_force_mag = link_forces[:, self.right_finger.idx_local, :].norm(dim=-1)  # (N,)
-        avg_force       = (left_force_mag + right_force_mag) * 0.5    # (N,)
+        avg_force = (left_force_mag + right_force_mag) * 0.5  # (N,)
 
-        cuboid_rel_z = cuboid_pos[:, 2] - finger_mid[:, 2]            # (N,)
-        cuboid_rel_x = cuboid_pos[:, 0] - finger_mid[:, 0]            # (N,)
-        cuboid_rel_y = cuboid_pos[:, 1] - finger_mid[:, 1]            # (N,)
-        ee_z     = ee_pos[:, 2]                                        # (N,)
-        ee_vel_z = ee_vel[:, 2]                                        # (N,)
+        cuboid_rel = self._world_vector_to_task(cuboid_pos - finger_mid)
+        cuboid_rel_x, cuboid_rel_y, cuboid_rel_z = cuboid_rel.unbind(dim=-1)
+        ee_z = self._task_position_z(ee_pos)
+        ee_vel_z = self._world_vector_to_task(ee_vel)[:, 2]
 
         # ---- done conditions ----
-        timeout = self.episode_length_buf >= self.max_episode_length   # (N,)
+        timeout = self.episode_length_buf >= self.max_episode_length  # (N,)
 
         # Track consecutive steps in firm grasp (reset when grasp is lost)
         firm_grasp_now = avg_force >= self.REGRASP_FORCE_THRESHOLD
@@ -773,35 +824,31 @@ class FrankaEnvParallel:
             & (ee_z <= self.SUCCESS_EE_Z_MAX)
         )
         # Named so the training table can report which one ends each episode.
-        fail_rel_x     = cuboid_rel_x.abs() > 0.04
-        fail_rel_y     = cuboid_rel_y.abs() > 0.04
+        fail_rel_x = cuboid_rel_x.abs() > 0.04
+        fail_rel_y = cuboid_rel_y.abs() > 0.04
         fail_fingertip = fingertip_dist < 0.01
-        fail_rel_z     = cuboid_rel_z.abs() > 0.15
-        fail_ee_low    = ee_z < 0.6
-        fail_ee_high   = ee_z > 0.96
+        fail_rel_z = cuboid_rel_z.abs() > 0.15
+        fail_ee_low = ee_z < 0.6
+        fail_ee_high = ee_z > 0.96
         fail = fail_rel_x | fail_rel_y | fail_fingertip | fail_rel_z | fail_ee_low | fail_ee_high
 
         # ---- regrasp event tracking ----
-        firm_grasp     = firm_grasp_now                                # (N,)
-        fully_released = avg_force < self.FORCE_FREE_THRESHOLD         # (N,)
+        firm_grasp = firm_grasp_now  # (N,)
+        fully_released = avg_force < self.FORCE_FREE_THRESHOLD  # (N,)
 
         # Snapshot cuboid_rel_z at the start of each release window
         release_start = fully_released & (~self._in_release)
-        self._release_start_step = torch.where(
-            release_start, self.episode_length_buf, self._release_start_step
-        )
-        self._release_cuboid_rel_z = torch.where(
-            release_start, cuboid_rel_z, self._release_cuboid_rel_z
-        )
+        self._release_start_step = torch.where(release_start, self.episode_length_buf, self._release_start_step)
+        self._release_cuboid_rel_z = torch.where(release_start, cuboid_rel_z, self._release_cuboid_rel_z)
 
         # A regrasp event = was in release → now firm grasp
-        regrasp_event = self._in_release & firm_grasp                  # (N,)
+        regrasp_event = self._in_release & firm_grasp  # (N,)
         self._in_release = (self._in_release | fully_released) & (~regrasp_event)
 
         # Optional: terminate episode after too many regrasps
         # Always terminate as failure on the REGRASP_TERMINATION_COUNT-th regrasp
         limit_fail = regrasp_event & (self._regrasp_count + 1 >= self.REGRASP_TERMINATION_COUNT)
-        fail    = fail    | limit_fail
+        fail = fail | limit_fail
         success_candidate = success_candidate & ~limit_fail
 
         success_candidate = success_candidate & (~fail)
@@ -817,13 +864,11 @@ class FrankaEnvParallel:
 
         # ---- regrasp bonus: reward = 0 for opening alone; stronger penalty if z_error got worse ----
         # Scale: perfect 30 mm improvement → +250; 0 mm improvement → 0; worse → negative x5.
-        # maximum z_improvement happens with acceleration 2*(g - mu_k*N) and the z_improvement is 
-        # 0.5*(EE acceleration - g - mu_k*N)* t_pulse**2 = Z_improvement_est and based on actual gap 
-        # and time by time acceleration of the robot EE, all of these only in comment to be in future 
-        # in observation, or used to estimate mu_k * N
-        z_err_before  = (self._release_cuboid_rel_z - self.desired_rel_z).abs()  # (N,)
-        z_err_after   = (cuboid_rel_z               - self.desired_rel_z).abs()  # (N,)
-        z_improvement = z_err_before - z_err_after                               # (N,) positive = closer
+        # All distances are along the fixed grasp axis. Gravity in these coordinates
+        # is the projection of world gravity; no vertical free-fall estimate is used.
+        z_err_before = (self._release_cuboid_rel_z - self.desired_rel_z).abs()  # (N,)
+        z_err_after = (cuboid_rel_z - self.desired_rel_z).abs()  # (N,)
+        z_improvement = z_err_before - z_err_after  # (N,) positive = closer
         raw_regrasp_bonus = (z_improvement.clamp(min=-0.05) * 15000.0).clamp(max=250.0)
         raw_regrasp_bonus = torch.where(
             raw_regrasp_bonus < 0.0,
@@ -833,12 +878,21 @@ class FrankaEnvParallel:
         # Bonus only for the first REGRASP_BONUS_MAX_COUNT regrasps. _regrasp_count was
         # already incremented above, so the k-th regrasp event sees _regrasp_count == k.
         bonus_eligible = regrasp_event & (self._regrasp_count <= self.REGRASP_BONUS_MAX_COUNT)
-        regrasp_bonus = (
-            raw_regrasp_bonus * bonus_eligible.float()
-        )  # (N,)
+        regrasp_bonus = raw_regrasp_bonus * bonus_eligible.float()  # (N,)
+
+        # ---- proximity reward: dense, exponential, never negative ----
+        # Distance along the fixed grasp axis between where the cuboid sits in the
+        # fingers and where it was asked to sit. Paid every step, so it shapes the
+        # approach instead of only scoring the regrasp that caused it.
+        proximity_gap = (cuboid_rel_z - self.desired_rel_z).abs()  # (N,) metres
+        _k = self.PROXIMITY_REWARD_SHARPNESS
+        _floor = math.exp(-_k)
+        _decay = torch.exp(-_k * proximity_gap / self.PROXIMITY_REWARD_RANGE)
+        proximity_reward = self.PROXIMITY_REWARD_MAX * (_decay - _floor) / (1.0 - _floor)
+        proximity_reward = proximity_reward.clamp(0.0, self.PROXIMITY_REWARD_MAX)  # (N,)
 
         # ---- jerk penalty: penalise jerky EE velocity commands ----
-        jerk         = (self.target_z_vel - self.prev_target_z_vel) / self.Z_VEL_MAX  # (N,)
+        jerk = (self.target_z_vel - self.prev_target_z_vel) / self.Z_VEL_MAX  # (N,)
         # jerk_penalty = torch.where(fully_released, torch.zeros_like(jerk), -1.0 * jerk.pow(2))  # (N,)
         jerk_penalty = -0.2 * jerk.pow(2)
 
@@ -847,26 +901,20 @@ class FrankaEnvParallel:
         # apart the two samples are. torch.sign is 0 at exactly zero, so a product below zero
         # means both samples are non-zero and point opposite ways.
         _sign_flip = (torch.sign(self.prev_target_z_vel) * torch.sign(self.target_z_vel)) < 0
-        _flip_jump = (self.target_z_vel - self.prev_target_z_vel).abs()          # (N,) m/s
+        _flip_jump = (self.target_z_vel - self.prev_target_z_vel).abs()  # (N,) m/s
         self.direction_change_count = self.direction_change_count + _sign_flip.long()
-        vel_sign_flip_penalty = (
-            -self.VEL_SIGN_FLIP_PENALTY_PER_MPS * _flip_jump * _sign_flip.float()
-        )  # (N,)
+        vel_sign_flip_penalty = -self.VEL_SIGN_FLIP_PENALTY_PER_MPS * _flip_jump * _sign_flip.float()  # (N,)
 
-        # ---- vertical acceleration penalty ----
+        # ---- grasp-axis acceleration penalty ----
         # Only the commanded acceleration beyond Z_ACC_PENALTY_THRESHOLD costs anything,
         # normalised by Z_ACC_MAX so the term is dimensionless like the jerk penalty.
         # Same weight at every step, with or without the pulse lockout.
-        _acc_excess = (
-            (self.target_z_acc.abs() - self.Z_ACC_PENALTY_THRESHOLD).clamp(min=0.0)
-            / self.Z_ACC_MAX
-        )  # (N,)
+        _acc_excess = (self.target_z_acc.abs() - self.Z_ACC_PENALTY_THRESHOLD).clamp(min=0.0) / self.Z_ACC_MAX  # (N,)
         z_acc_penalty = -self.Z_ACC_PENALTY_WEIGHT * _acc_excess.pow(2)  # (N,)
 
         # Advance the trigger clock, capped one past the lockout so the counter cannot
         # grow without bound.
-        self._steps_since_pulse = (self._steps_since_pulse + 1).clamp(
-            max=self._pulse_lockout_steps + 1)
+        self._steps_since_pulse = (self._steps_since_pulse + 1).clamp(max=self._pulse_lockout_steps + 1)
 
         # ---- terminal reward (dominates with gamma=0.99) ----
         ep = self.episode_length_buf.float()
@@ -874,12 +922,12 @@ class FrankaEnvParallel:
             success,
             self.SUCCESS_REWARD - ep * self.SUCCESS_TIME_PENALTY,
             torch.where(
-                fail,                                     # checked before timeout: fail wins
+                fail,  # checked before timeout: fail wins
                 torch.full_like(ee_z, -self.fail_penalty()),
                 torch.where(
                     timeout,
                     torch.full_like(ee_z, -self.TIMEOUT_PENALTY),
-                    torch.full_like(ee_z, -self.ALIVE_PENALTY),   # urgency to finish
+                    torch.full_like(ee_z, -self.ALIVE_PENALTY),  # urgency to finish
                 ),
             ),
         )
@@ -887,18 +935,18 @@ class FrankaEnvParallel:
         # ---- post-pulse hold penalty: penalise instability after regrasp ----
         _in_delay_window = self._post_pulse_delay_countdown > 0
         _in_hold_window = (~_in_delay_window) & (self._post_pulse_hold_countdown > 0)  # (N,)
-        
+
         # Penalize velocity if it exceeds the limit
         vel_err = (ee_vel_z.abs() - self.POST_PULSE_HOLD_VEL_MAX).clamp(min=0.0)
         # Penalize distance from target
         z_err = (ee_z - self.POST_PULSE_HOLD_Z_TARGET).abs()
-        
+
         post_pulse_hold_penalty = torch.where(
             _in_hold_window,
-            - (vel_err * self.POST_PULSE_HOLD_PENALTY_VEL) - (z_err * self.POST_PULSE_HOLD_PENALTY_Z),
+            -(vel_err * self.POST_PULSE_HOLD_PENALTY_VEL) - (z_err * self.POST_PULSE_HOLD_PENALTY_Z),
             torch.zeros_like(ee_z),
         )  # (N,)
-        
+
         # Decrement the countdowns
         self._post_pulse_hold_countdown = torch.where(
             (~_in_delay_window) & (self._post_pulse_hold_countdown > 0),
@@ -910,39 +958,36 @@ class FrankaEnvParallel:
         _w = self.REWARD_TERM_WEIGHTS
         reward = (
             _w["base_reward"] * base_reward
+            + _w["proximity_reward"] * proximity_reward
             + _w["regrasp_bonus"] * regrasp_bonus
-            + _w["jerk_penalty"] * jerk_penalty
             + _w["z_acc_penalty"] * z_acc_penalty
-            + _w["vel_sign_flip_penalty"] * vel_sign_flip_penalty
-            + _w["post_pulse_hold_penalty"] * post_pulse_hold_penalty
         )
 
         self.last_reward_terms = {
-            "base_reward":   base_reward.detach().clone(),
+            "base_reward": base_reward.detach().clone(),
+            "proximity_reward": proximity_reward.detach().clone(),
             "regrasp_bonus": regrasp_bonus.detach().clone(),
-            "jerk_penalty":  jerk_penalty.detach().clone(),
             "z_acc_penalty": z_acc_penalty.detach().clone(),
-            "vel_sign_flip_penalty": vel_sign_flip_penalty.detach().clone(),
+            "proximity_gap": proximity_gap.detach().clone(),
             "direction_change_count": self.direction_change_count.float().detach().clone(),
             "z_improvement": z_improvement.detach().clone(),
-            "avg_force":     avg_force.detach().clone(),
+            "avg_force": avg_force.detach().clone(),
             "regrasp_event": regrasp_event.float().detach().clone(),
             "success_candidate": success_candidate.float().detach().clone(),
             "success_steps": self._success_steps.float().detach().clone(),
-            "post_pulse_hold_penalty": post_pulse_hold_penalty.detach().clone(),
             # ep_* keys describe how an episode ended. They are read by the training
             # table only on the step an env terminates, never averaged per step.
-            "ep_done":              done.float(),
-            "ep_success":           success.float(),
-            "ep_fail":              fail.float(),
-            "ep_timeout":           (timeout & ~fail & ~success).float(),
-            "ep_length":            self.episode_length_buf.float(),
-            "ep_fail_rel_x":        fail_rel_x.float(),
-            "ep_fail_rel_y":        fail_rel_y.float(),
-            "ep_fail_fingertip":    fail_fingertip.float(),
-            "ep_fail_rel_z":        fail_rel_z.float(),
-            "ep_fail_ee_low":       fail_ee_low.float(),
-            "ep_fail_ee_high":      fail_ee_high.float(),
+            "ep_done": done.float(),
+            "ep_success": success.float(),
+            "ep_fail": fail.float(),
+            "ep_timeout": (timeout & ~fail & ~success).float(),
+            "ep_length": self.episode_length_buf.float(),
+            "ep_fail_rel_x": fail_rel_x.float(),
+            "ep_fail_rel_y": fail_rel_y.float(),
+            "ep_fail_fingertip": fail_fingertip.float(),
+            "ep_fail_rel_z": fail_rel_z.float(),
+            "ep_fail_ee_low": fail_ee_low.float(),
+            "ep_fail_ee_high": fail_ee_high.float(),
             "ep_fail_regrasp_limit": limit_fail.float(),
         }
 
@@ -953,26 +998,27 @@ class FrankaEnvParallel:
         q = self.q_home.unsqueeze(0).expand(len(envs_idx), -1)
         self.franka.set_qpos(q, envs_idx=envs_idx, zero_velocity=True)
         self.franka.control_dofs_position(q, envs_idx=envs_idx)
+        self._reset_task_frame(envs_idx)
         self._reset_cuboid_home_pose(envs_idx)
 
-        ee_pos = self.ee_link.get_pos()    # FK updated by set_qpos
-        ee_quat = self.ee_link.get_quat()
-        self.target_center[envs_idx] = ee_pos[envs_idx].clone()
-        self.target_quat[envs_idx] = ee_quat[envs_idx].clone()
-        self.target_z[envs_idx] = ee_pos[envs_idx, 2].clone()
+        self.target_center[envs_idx] = self.task_origin[envs_idx]
+        self.target_quat[envs_idx] = self.task_quat[envs_idx]
+        self.target_z[envs_idx] = self.HOME_TASK_Z
         self.target_z_vel[envs_idx] = 0.0
         self.target_z_acc[envs_idx] = 0.0
         self.prev_target_z_vel[envs_idx] = 0.0
         self.direction_change_count[envs_idx] = 0
         _n = len(envs_idx)
-        _mag = 0.01 + torch.rand(_n, device=self.device) * 0.01   # uniform in [0.02, 0.04]
+        _mag = 0.01 + torch.rand(_n, device=self.device) * 0.01  # uniform in [0.02, 0.04]
         if self.mix:
-            _sign = torch.where(torch.rand(_n, device=self.device) < 0.5,
-                                torch.ones(_n, device=self.device),
-                                torch.full((_n,), -1.0, device=self.device))
-            _mag = _sign * _mag   # randomly flip sign per env
+            _sign = torch.where(
+                torch.rand(_n, device=self.device) < 0.5,
+                torch.ones(_n, device=self.device),
+                torch.full((_n,), -1.0, device=self.device),
+            )
+            _mag = _sign * _mag  # randomly flip sign per env
         elif self.solid_up:
-            _mag = -_mag   # negative desired_rel_z → solid-up training regime
+            _mag = -_mag  # negative desired_rel_z → solid-up training regime
         self.desired_rel_z[envs_idx] = _mag
         self.episode_length_buf[envs_idx] = 0
         self._in_release[envs_idx] = False
@@ -1063,9 +1109,8 @@ class FrankaEnvParallel:
     def _randomize_finger_gains(self, envs_idx: torch.Tensor):
         """Sample one shared finger value per env and apply it with preserved signs."""
         n = len(envs_idx)
-        value = (
-            self.FINGER_GAIN_RANDOM_MIN
-            + torch.rand(n, device=self.device) * (self.FINGER_GAIN_RANDOM_MAX - self.FINGER_GAIN_RANDOM_MIN)
+        value = self.FINGER_GAIN_RANDOM_MIN + torch.rand(n, device=self.device) * (
+            self.FINGER_GAIN_RANDOM_MAX - self.FINGER_GAIN_RANDOM_MIN
         )
         if not hasattr(self, "_finger_gain_values"):
             self._finger_gain_values = torch.zeros(self.num_envs, device=self.device)
@@ -1085,12 +1130,8 @@ class FrankaEnvParallel:
 
         target_z, target_z_vel: (N,)
         """
-        N = self.num_envs
-
-        # Build Cartesian target pos/vel (only z changes)
-        target_pos = self.target_center.clone()          # (N, 3)
-        target_pos[:, 2] = target_z
-        target_vel = torch.zeros(N, 3, device=self.device)
+        # Fixed straight line in world space; scalar speed retains its m/s scale.
+        target_pos = self._task_target_position(target_z)
         # 2nd-order low-pass filter: H(s) = 5625 / (s² + 49.5 s + 5625) at 1000 Hz
         # y[n] = b0*u[n] + b1*u[n-1] + b2*u[n-2] - a1*y[n-1] - a2*y[n-2]
         _u_n = target_z_vel
@@ -1105,22 +1146,30 @@ class FrankaEnvParallel:
         self._filt_u1 = _u_n
         self._filt_y2 = self._filt_y1.clone()
         self._filt_y1 = target_z_vel.clone()
-        target_vel[:, 2] = target_z_vel
+        target_vel = self.task_axes[:, :, 2] * target_z_vel.unsqueeze(-1)
 
         # EE state
-        ee_pos = self.ee_link.get_pos()    # (N, 3)
+        ee_pos = self.ee_link.get_pos()  # (N, 3)
         ee_quat = self.ee_link.get_quat()  # (N, 4)
 
         # Cartesian error
-        error_pos = target_pos - ee_pos    # (N, 3)
+        error_pos = target_pos - ee_pos  # (N, 3)
+        axis = self.task_axes[:, :, 2]
+        axial_error = (error_pos * axis).sum(dim=-1, keepdim=True) * axis
+        # Stronger transverse feedback resists gravity-induced sideways drift;
+        # the axial gain and filtered action dynamics retain their original values.
+        position_feedback = self.pos_gain * axial_error + self.transverse_pos_gain * (error_pos - axial_error)
         rel_quat = _tc_quat_mul(self.target_quat, _tc_inv_quat(ee_quat))  # (N, 4)
         error_rotvec = _tc_quat_to_rotvec(rel_quat)  # (N, 3)
 
         # ee_velocity_cmd: (N, 6)
-        ee_vel_cmd = torch.cat([
-            target_vel + self.pos_gain * error_pos,   # (N, 3)
-            self.rot_gain * error_rotvec,              # (N, 3)
-        ], dim=-1)
+        ee_vel_cmd = torch.cat(
+            [
+                target_vel + position_feedback,  # (N, 3)
+                self.rot_gain * error_rotvec,  # (N, 3)
+            ],
+            dim=-1,
+        )
 
         # Jacobian: (N, 6, n_dof_total) → slice motor dofs → (N, 6, 7)
         J_full = self.franka.get_jacobian(link=self.ee_link)  # (N, 6, n_dof)
@@ -1152,13 +1201,14 @@ class FrankaEnvParallel:
 
         local_t = torch.clamp(
             torch.full((self.num_envs,), t, device=self.device) - self._seg_t0,
-            0.0, self.target_period,
+            0.0,
+            self.target_period,
         )
         s = (local_t / self.target_period).clamp(0.0, 1.0)  # (N,)
         s2, s3 = s * s, s * s * s
 
         z0, zv0 = self._seg_start[:, 0], self._seg_start[:, 1]
-        z1, zv1 = self._seg_end[:, 0],   self._seg_end[:, 1]
+        z1, zv1 = self._seg_end[:, 0], self._seg_end[:, 1]
         T = self.target_period
 
         h00 = 2 * s3 - 3 * s2 + 1
@@ -1180,13 +1230,71 @@ class FrankaEnvParallel:
     # Internal: utilities                                                 #
     # ------------------------------------------------------------------ #
 
+    @staticmethod
+    def _joint5_for_tilt(tilt_deg: float, joint_axis_z: float) -> float:
+        """Invert Rodrigues' formula for rotating vertical about joint 5's axis."""
+        if not math.isfinite(tilt_deg) or not 0.0 <= tilt_deg <= 45.0:
+            raise ValueError("tilt_deg must be a finite angle between 0 and 45 degrees")
+        # z dot R(axis, q) z = axis_z**2 + (1-axis_z**2) * cos(q).
+        axis_z_sq = joint_axis_z**2
+        if axis_z_sq >= 1.0 - 1e-8:
+            raise ValueError("Joint 5 is parallel to vertical and cannot produce the requested tilt")
+        cosine = (math.cos(math.radians(tilt_deg)) - axis_z_sq) / (1.0 - axis_z_sq)
+        if not -1.0 <= cosine <= 1.0 + 1e-8:
+            raise ValueError("Requested tilt is unreachable by rotating joint 5")
+        return -math.acos(max(-1.0, min(1.0, cosine)))
+
+    def _configure_home_pose(self):
+        """Calculate home once from the model; reset reuses this fixed pose/frame."""
+        from genesis.utils.geom import transform_by_quat
+
+        self.franka.set_qpos(self.q_home.expand(self.num_envs, -1), zero_velocity=True)
+        baseline_quat = self.ee_link.get_quat()[0].clone()
+        # The MJCF joint5 is a hinge around link5 local +Z.
+        joint_quat = self.franka.get_link("link5").get_quat()[0]
+        joint_axis = transform_by_quat(torch.tensor([0.0, 0.0, 1.0], device=self.device), joint_quat)
+        self.q_home[4] = self._joint5_for_tilt(self.tilt_deg, float(joint_axis[2]))
+        self.franka.set_qpos(self.q_home.expand(self.num_envs, -1), zero_velocity=True)
+        self._home_frame_quat = _tc_quat_mul(self.ee_link.get_quat()[0], _tc_inv_quat(baseline_quat))
+        if self.tilt_deg == 0.0:
+            self._home_frame_quat = torch.tensor([1.0, 0.0, 0.0, 0.0], device=self.device)
+        self.cfg["home_arm_q"] = self.q_home[:7].tolist()
+
+    def _reset_task_frame(self, envs_idx: torch.Tensor):
+        """Cache the nominal FK frame before warmup; only reset selected rows."""
+        from genesis.utils.geom import transform_by_quat
+
+        if not hasattr(self, "task_origin"):
+            self.task_origin = torch.zeros(self.num_envs, 3, device=self.device)
+            self.task_quat = torch.zeros(self.num_envs, 4, device=self.device)
+            self.task_axes = torch.zeros(self.num_envs, 3, 3, device=self.device)
+        self.task_origin[envs_idx] = self.ee_link.get_pos()[envs_idx]
+        self.task_quat[envs_idx] = self.ee_link.get_quat()[envs_idx]
+        # Rotate the ORIGINAL world task frame by the home orientation change.
+        # Unlike using raw hand axes, this gives exactly world XYZ at zero tilt.
+        frame_quat = self._home_frame_quat.expand(len(envs_idx), -1)
+        for column in range(3):
+            local_axis = torch.eye(3, device=self.device)[column].expand(len(envs_idx), -1)
+            self.task_axes[envs_idx, :, column] = transform_by_quat(local_axis, frame_quat)
+
+    def _world_vector_to_task(self, vector: torch.Tensor) -> torch.Tensor:
+        """Project world displacements/velocities into the fixed home frame."""
+        return torch.einsum("nji,nj->ni", self.task_axes, vector)
+
+    def _task_position_z(self, world_pos: torch.Tensor) -> torch.Tensor:
+        return self.HOME_TASK_Z + self._world_vector_to_task(world_pos - self.task_origin)[:, 2]
+
+    def _task_target_position(self, target_z: torch.Tensor) -> torch.Tensor:
+        return self.target_center + self.task_axes[:, :, 2] * (target_z - self.HOME_TASK_Z).unsqueeze(-1)
+
     def _fingertip_pos(self, finger_link) -> torch.Tensor:
         """Compute fingertip world position (N, 3) from link pose."""
-        pos = finger_link.get_pos()    # (N, 3)
+        pos = finger_link.get_pos()  # (N, 3)
         quat = finger_link.get_quat()  # (N, 4)
         # Rotate local offset by link orientation, then add to link pos
         # transform_by_quat supports torch batched inputs
         from genesis.utils.geom import transform_by_quat as _tbq
+
         offset = self.fingertip_local.unsqueeze(0).expand(self.num_envs, -1)  # (N, 3)
         return pos + _tbq(offset, quat)
 
@@ -1199,10 +1307,12 @@ class FrankaEnvParallel:
     def _reset_cuboid_home_pose(self, envs_idx: torch.Tensor):
         from genesis.utils.geom import transform_by_quat as _tbq, transform_quat_by_quat as _tqbq
 
-        hand_pos = self.ee_link.get_pos()[envs_idx]    # (|idx|, 3)
+        hand_pos = self.ee_link.get_pos()[envs_idx]  # (|idx|, 3)
         hand_quat = self.ee_link.get_quat()[envs_idx]  # (|idx|, 4)
 
         local_offset = torch.tensor([0.0, 0.0, 0.1029], device=self.device)
+        # Keep the original grasp alignment relative to the hand. Its long axis
+        # is world +Z at zero tilt and follows the rotated task +Z at other angles.
         local_quat_np = np.array([0.00187891, -0.71790805, -0.00193768, -0.69613270])
         local_quat_np /= np.linalg.norm(local_quat_np)
         local_quat = torch.tensor(local_quat_np, dtype=hand_quat.dtype, device=self.device)
@@ -1218,15 +1328,13 @@ class FrankaEnvParallel:
         self.cuboid.set_quat(cuboid_quat, zero_velocity=True, envs_idx=envs_idx)
 
     def _set_franka_gains(self):
-        kp_motors = torch.tensor([4500, 4500, 3500, 3500, 2000, 2000, 2000],
-                                  dtype=torch.float32, device=self.device)
+        kp_motors = torch.tensor([4500, 4500, 3500, 3500, 2000, 2000, 2000], dtype=torch.float32, device=self.device)
         # 0.35 x the nominal [450 450 350 350 200 200 200], tuned for real-arm-like lag
-        kv_motors = torch.tensor([157.5, 157.5, 122.5, 122.5, 70.0, 70.0, 70.0],
-                                  dtype=torch.float32, device=self.device)
-        f_lo = torch.tensor([-87, -87, -87, -87, -12, -12, -12],
-                             dtype=torch.float32, device=self.device)
-        f_hi = torch.tensor([87, 87, 87, 87, 12, 12, 12],
-                              dtype=torch.float32, device=self.device)
+        kv_motors = torch.tensor(
+            [157.5, 157.5, 122.5, 122.5, 70.0, 70.0, 70.0], dtype=torch.float32, device=self.device
+        )
+        f_lo = torch.tensor([-87, -87, -87, -87, -12, -12, -12], dtype=torch.float32, device=self.device)
+        f_hi = torch.tensor([87, 87, 87, 87, 12, 12, 12], dtype=torch.float32, device=self.device)
 
         envs_idx = torch.arange(self.num_envs, device=self.device)
         self.franka.set_dofs_kp(kp_motors.unsqueeze(0).expand(self.num_envs, -1), self.motors_dof, envs_idx=envs_idx)
@@ -1244,6 +1352,9 @@ class FrankaEnvParallel:
 
 
 # ---------------------------------------------------------------------------
+# Canonical name supported by the existing training/evaluation module loaders.
+FrankaEnvParallel = FrankaEnvParallelTilted
+
 # Minimal smoke-test
 # ---------------------------------------------------------------------------
 if __name__ == "__main__":
@@ -1252,13 +1363,16 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("-B", "--num_envs", type=int, default=16)
     parser.add_argument("--vis", action="store_true")
+    parser.add_argument("--tilt-deg", type=float, default=FrankaEnvParallel.DEFAULT_TILT_DEG)
     parser.add_argument("--steps", type=int, default=50)
     parser.add_argument("--limit-regrasp", action="store_true")
     args = parser.parse_args()
 
     gs.init(backend=gs.gpu, precision="32", logging_level="warning")
 
-    env = FrankaEnvParallel(num_envs=args.num_envs, vis=args.vis, limit_regrasp=args.limit_regrasp)
+    env = FrankaEnvParallel(
+        num_envs=args.num_envs, vis=args.vis, limit_regrasp=args.limit_regrasp, tilt_deg=args.tilt_deg
+    )
     obs_td = env.reset()
     print("obs shape:", obs_td["policy"].shape)
     print("obs_dim:", FrankaEnvParallel.OBS_DIM)
@@ -1267,4 +1381,4 @@ if __name__ == "__main__":
         actions = torch.zeros(args.num_envs, 3, device=gs.device)
         obs_td, rew_buf, reset_buf, extras = env.step(actions)
 
-    print("Done. ee_pos_z mean:", obs_td["policy"][:, FrankaEnvParallel.OBS_EE_POS_Z].mean().item())
+    print("Done. grasp-axis EE position mean:", obs_td["policy"][:, FrankaEnvParallel.OBS_EE_POS_Z].mean().item())

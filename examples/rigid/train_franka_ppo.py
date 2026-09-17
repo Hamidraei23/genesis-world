@@ -21,6 +21,7 @@ Inside docker (genesis container):
 import argparse
 import importlib
 import inspect
+import math
 import os
 import pickle
 import shutil
@@ -37,6 +38,9 @@ except (metadata.PackageNotFoundError, ImportError) as e:
 from rsl_rl.runners import OnPolicyRunner
 
 import genesis as gs
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from reward_table import RewardTermTracker
 
 
 DEFAULT_ENV = "env_franka_parallel"
@@ -95,6 +99,19 @@ def load_env_class(spec: str):
         f"Multiple environment classes in {module_name} ({names}); "
         f"pick one with --env {module_spec}:ClassName"
     )
+
+
+def resolve_tilt_kwargs(env_cls, tilt_deg: float | None) -> dict:
+    """Resolve an optional tilt without silently dropping an explicit request."""
+    parameter = inspect.signature(env_cls.__init__).parameters.get("tilt_deg")
+    if parameter is None:
+        if tilt_deg is not None:
+            raise ValueError("--tilt-deg requires an environment supporting tilt_deg, e.g. env_franka_parallel_tilted")
+        return {}
+    angle = float(parameter.default if tilt_deg is None else tilt_deg)
+    if not math.isfinite(angle) or not 0.0 <= angle <= 45.0:
+        raise ValueError("--tilt-deg must be a finite angle between 0 and 45 degrees")
+    return {"tilt_deg": angle}
 
 
 def build_env(env_cls, kwargs: dict):
@@ -168,13 +185,16 @@ def get_train_cfg(exp_name: str) -> dict:
 # Entry point
 # ---------------------------------------------------------------------------
 
-def main():
-    parser = argparse.ArgumentParser(description="PPO training for FrankaEnvParallel")
+def build_parser(description: str = "PPO training for FrankaEnvParallel") -> argparse.ArgumentParser:
+    """Arguments shared by every Franka PPO training entry point."""
+    parser = argparse.ArgumentParser(description=description)
     parser.add_argument("-e", "--exp_name", type=str, default="franka-lift",
                         help="Experiment name; also used as log subdirectory")
     parser.add_argument("--env", type=str, default=DEFAULT_ENV,
                         help="Environment module to train on: a module name next to this script "
                              "(env_franka_parallel_june), a .py path, optionally with ':ClassName'")
+    parser.add_argument("--tilt-deg", type=float, default=None,
+                        help="Fixed grasp-axis tilt in degrees (0-45); tilted environment defaults to 30")
     parser.add_argument("-B", "--num_envs", type=int, default=1024,
                         help="Number of parallel environments")
     parser.add_argument("--max_iterations", type=int, default=1000,
@@ -203,10 +223,15 @@ def main():
                         help="Enable fixed observation normalization (scales each obs channel to ~[-1, 1])")
     parser.add_argument("--zero", action="store_true",
                         help="Enable post-pulse zero-z-velocity + close-gripper hold inside the environment")
+    parser.add_argument("--no-reward-table", dest="reward_table", action="store_false",
+                        help="Disable the per-iteration reward-term table (printed by default)")
     parser.add_argument("--control-error", action="store_true",
                         help="Add per-episode constant z-velocity command bias sampled in [-0.05, -0.03] U [0.03, 0.05]")
-    args = parser.parse_args()
+    return parser
 
+
+def validate_args(parser: argparse.ArgumentParser, args) -> None:
+    """Reject flag combinations that cannot be honoured."""
     if args.randomize_at is not None:
         if args.randomize:
             parser.error("--randomize-at and --randomize are mutually exclusive: "
@@ -214,12 +239,15 @@ def main():
         if not 0 < args.randomize_at < args.max_iterations:
             parser.error(f"--randomize-at must be in (0, --max_iterations={args.max_iterations})")
 
+
+def run_training(args, train_cfg: dict) -> None:
+    """Build the env, the runner and run the learning loop for the given config."""
     # Resolve the env class first so a bad --env fails before logs are touched
     env_cls = load_env_class(args.env)
+    tilt_kwargs = resolve_tilt_kwargs(env_cls, args.tilt_deg)
     print(f"Environment: {env_cls.__module__}.{env_cls.__name__}")
 
     log_dir = f"logs/{args.exp_name}"
-    train_cfg = get_train_cfg(args.exp_name)
 
     # Fresh run: wipe old logs; resume: keep them
     if args.resume is None:
@@ -245,6 +273,7 @@ def main():
             "solid_up": args.negative,
             "dt": args.dt,
             "target_dt": args.target_dt,
+            **tilt_kwargs,
         }, f)
 
     gs.init(
@@ -269,10 +298,14 @@ def main():
             normalize=args.normalization,
             zero=args.zero,
             control_error=args.control_error,
+            **tilt_kwargs,
         ),
     )
 
     runner = OnPolicyRunner(env, train_cfg, log_dir, device=gs.device)
+
+    if args.reward_table:
+        RewardTermTracker(env).attach(runner)
 
     if args.resume is not None:
         runner.load(args.resume)
@@ -303,6 +336,13 @@ def main():
             num_learning_iterations=args.max_iterations - args.randomize_at,
             init_at_random_ep_len=False,
         )
+
+
+def main():
+    parser = build_parser()
+    args = parser.parse_args()
+    validate_args(parser, args)
+    run_training(args, get_train_cfg(args.exp_name))
 
 
 if __name__ == "__main__":

@@ -65,22 +65,18 @@ class FrankaEnvParallel:
     """
     Vectorised Franka environment.
 
-    Observations: flat tensor (N, OBS_DIM=10)
+    Observations: flat tensor (N, OBS_DIM=14)
         [0]    ee_pos_z
         [1]    ee_vel_z
         [2]    target_z_vel
         [3]    target_z_acc
-        [4]    left_force_mag   (scalar)
-        [5]    right_force_mag  (scalar)
-        [6]    cuboid_rel_z
-        [7]    cuboid_rel_x
-        [8]    cuboid_rel_y
-        [9]    desired_rel_z
-        
-        Future Observations (To be added):
-        [10]   last_pulse_gap_z_improve (LAST PULSE GAP z improvement)
-        [11]   pulse_gap_duration (Duration of gap derived from finger pos)
-        [12]   acc_drop_to_open_delay (Delay from the moment acceleration of EE goes below -10.0 to the moment end effector opens, in ms. Can be positive or negative)
+        [4]    cuboid_rel_z
+        [5]    cuboid_rel_x
+        [6]    cuboid_rel_y
+        [7]    desired_rel_z
+        [8:10]   last 2 z_improvement values (oldest → newest)
+        [10:12]  last 2 time-to-next(ee_vel_z < 0) after pulse-open, in ms (oldest → newest)
+        [12:14]  last 2 time-to-last(ee_vel_z < 0) after pulse-open, in ms (oldest → newest)
 
     Actions (per env, shape (N, action_dim=3)):
         [0]   target_z_vel
@@ -88,48 +84,41 @@ class FrankaEnvParallel:
     """
 
     # Observation layout constants
-    OBS_DIM            = 10
+    OBS_DIM            = 14
+    HISTORY_LEN        = 2
     OBS_EE_POS_Z       = 0
     OBS_EE_VEL_Z       = 1
     OBS_TARGET_Z_VEL   = 2
     OBS_TARGET_Z_ACC   = 3
-    OBS_LEFT_FORCE_MAG = 4
-    OBS_RIGHT_FORCE_MAG = 5
-    OBS_CUBOID_REL_Z   = 6
-    OBS_CUBOID_REL_X   = 7
-    OBS_CUBOID_REL_Y   = 8
-    OBS_DESIRED_REL_Z  = 9
-    # Future Observations (To be added):
-    # OBS_LAST_PULSE_GAP_Z_IMPROVE = 10
-    # OBS_PULSE_GAP_DURATION       = 11
-    # OBS_ACC_DROP_TO_OPEN_DELAY   = 12
+    OBS_CUBOID_REL_Z   = 4
+    OBS_CUBOID_REL_X   = 5
+    OBS_CUBOID_REL_Y   = 6
+    OBS_DESIRED_REL_Z  = 7
+    OBS_LAST_Z_IMPROVE_START = 8
+    OBS_NEXT_NEG_VEL_MS_START = 10
+    OBS_LAST_NEG_VEL_MS_START = 12
 
     # Fixed observation normalization scales (divide raw obs by these)
     # Order: ee_pos_z, ee_vel_z, target_z_vel, target_z_acc,
-    #        left_force_mag, right_force_mag,
-    #        cuboid_rel_z, cuboid_rel_x, cuboid_rel_y, desired_rel_z
-    #        (Future: last_pulse_gap_z_improve, pulse_gap_duration, acc_drop_to_open_delay)
-    OBS_SCALE = [1.0, 0.6, 0.6, 15.0, 5.0, 5.0, 0.05, 0.05, 0.05, 0.05]
-
-    # Weights applied to each additive reward component in _compute_done_and_reward.
-    # Also read by reward_table.RewardTermTracker for the per-iteration table.
-    REWARD_TERM_WEIGHTS = {
-        "base_reward": 1.0,
-        "regrasp_bonus": 2.0,
-        "jerk_penalty": 1.0,
-        "z_acc_penalty": 1.0,
-        "vel_sign_flip_penalty": 1.0,
-        "post_pulse_hold_penalty": 1.0,
-    }
+    #        cuboid_rel_z, cuboid_rel_x, cuboid_rel_y, desired_rel_z,
+    #        z_improvement history,
+    #        time_to_next_neg_vel_ms history,
+    #        time_to_last_neg_vel_ms history
+    OBS_SCALE = (
+        [1.0, 0.6, 0.6, 15.0, 0.05, 0.05, 0.05, 0.05]
+        + [0.05] * HISTORY_LEN
+        + [200.0] * HISTORY_LEN
+        + [200.0] * HISTORY_LEN
+    )
 
     # Action scaling constants
-    Z_VEL_MAX       = 0.45
+    Z_VEL_MAX       = 0.6
     Z_ACC_MAX       = 15.00   # m/s² — hard limit on target-velocity rate of change
-    Z_ACC_PENALTY_THRESHOLD = 5.0
-    Z_ACC_PENALTY_WEIGHT    = 2.0
+    Z_ACC_PENALTY_THRESHOLD = 13.0
+    Z_ACC_PENALTY_WEIGHT    = 0.0
     EE_Z_TARGET     = 0.7
     GRIPPER_CLOSED  = 0.000251
-    GRIPPER_OPEN    = 0.0127   # per finger; gap 25.4 mm clears the 25 mm block
+    GRIPPER_OPEN    = 0.0124
     # Release-to-regrasp detection
     FORCE_FREE_THRESHOLD = 0.15  # N: avg finger force below this -> fully released
     REGRASP_FORCE_THRESHOLD = 0.75  # N: avg finger force at/above this -> firm grasp
@@ -141,38 +130,20 @@ class FrankaEnvParallel:
     FIRM_GRASP_SLIP_PENALTY_WEIGHT = 30.0  # harsh penalty per (m/step)² of Z-slip during firm grasp
     SUCCESS_EE_Z_MIN = 0.7
     SUCCESS_EE_Z_MAX = 0.86
-    SUCCESS_EE_VEL_MAX = 0.05   # m/s: |ee_vel_z| must be below this to count as settled
-    # Terminal and per-step base reward. Failing must always cost more than surviving to
-    # the timeout, otherwise ending an episode early is the cheapest outcome. The fail
-    # penalty is derived from these in _compute_done_and_reward, so that stays true if
-    # any of them or max_episode_length change.
-    SUCCESS_REWARD       = 3750.0   # +25 % over the previous 3000
-    SUCCESS_TIME_PENALTY = 0.5      # per episode step, subtracted from SUCCESS_REWARD
-    ALIVE_PENALTY        = 1.25     # per non-terminal step
-    TIMEOUT_PENALTY      = 250.0
-    FAIL_PENALTY_MARGIN  = 100.0    # fail = TIMEOUT + ALIVE * max_episode_length + margin
-    SUCCESS_REQUIRED_STEPS = 5
+    SUCCESS_REQUIRED_STEPS = 1
     EE_HOLD_Z_TARGET = 0.8
     EE_HOLD_Z_TOLERANCE = 0.025
     EE_HOLD_VEL_TOLERANCE = 0.02
     EE_HOLD_REQUIRED_STEPS = 5
     EE_HOLD_ACC_THRESHOLD = 2.0
     PULSE_DELAY_STEPS = 2   # target-period steps to wait before the open window begins
-    PULSE_DELAY_RANDOM_MIN = 1   # 20 ms
-    PULSE_DELAY_RANDOM_MAX = 2   # 40 ms
-    PULSE_LENGTH = 5   # steps: open window, then 1 close step, back to policy control
-    # The policy keeps commanding "open" through the delay, so the object is released for
-    # PULSE_DELAY + PULSE_LENGTH - 1 steps: 6 steps = 120 ms with the fixed values above.
-    # Holding the randomised length at 5 and letting the delay pick 1 or 2 steps keeps the
-    # randomised release inside 100-120 ms.
-    PULSE_LENGTH_RANDOM_MIN = 5
-    PULSE_LENGTH_RANDOM_MAX = 5
-    # Pulse lockout: no new pulse may start until this long after the previous TRIGGER.
-    PULSE_START_MIN_STEPS = 50        # no pulse may fire in the first N steps of an episode
-    PULSE_LOCKOUT_DURATION = 1.2      # s since the trigger before another pulse may fire
-    # Commanded-velocity sign flip, charged at every step (not only in the lockout) and in
-    # proportion to the size of the jump across zero: a 0.2 m/s flip costs 5, 0.8 m/s costs 20.
-    VEL_SIGN_FLIP_PENALTY_PER_MPS = 25.0
+    PULSE_DELAY_RANDOM_MIN = 1
+    PULSE_DELAY_RANDOM_MAX = 3
+    PULSE_LENGTH = 4   # steps: 5 open, 1 close, then back to policy control
+    PULSE_LENGTH_RANDOM_MIN = 3
+    PULSE_LENGTH_RANDOM_MAX = 6
+    ZERO_HOLD_DURATION_MIN = 0.1  # seconds
+    ZERO_HOLD_DURATION_MAX = 0.3  # seconds; used when randomize=True
     # Post-pulse hold penalty: after pulse completes, wait 0.5s, then penalise instability for 0.5s
     POST_PULSE_DELAY_DURATION = 0.5  # wait before evaluation window
     POST_PULSE_HOLD_DURATION = 0.5   # seconds
@@ -186,6 +157,8 @@ class FrankaEnvParallel:
     FRICTION_BASE = 0.75   # sliding friction in the MJCF files (dominant value)
     FRICTION_MIN  = 0.6   # minimum desired effective contact friction
     FRICTION_MAX  = 0.90   # maximum desired effective contact friction
+    CONTROL_ERROR_ABS_MIN = 0.03
+    CONTROL_ERROR_ABS_MAX = 0.06
 
     def __init__(
         self,
@@ -196,7 +169,7 @@ class FrankaEnvParallel:
         dt: float = 0.001,
         target_dt: float = 0.02,
         gripper_pos_min: float = 0.000251,
-        gripper_pos_max: float = 0.0127,
+        gripper_pos_max: float = 0.0124,
         pos_gain: float = 8.0,
         rot_gain: float = 4.0,
         jacobian_damping: float = 1e-4,
@@ -205,6 +178,8 @@ class FrankaEnvParallel:
         mix: bool = False,
         randomize: bool = False,
         normalize: bool = False,
+        zero: bool = False,
+        control_error: bool = False,
     ):
         self.num_envs = num_envs
         self.device = gs.device
@@ -219,6 +194,8 @@ class FrankaEnvParallel:
         self.mix = mix
         self.randomize = randomize
         self.normalize = normalize
+        self.zero = zero
+        self.control_error = control_error
         self.extras: dict = {}
         self.cfg = {
             "num_envs": num_envs,
@@ -235,13 +212,10 @@ class FrankaEnvParallel:
             "mix": mix,
             "randomize": randomize,
             "normalize": normalize,
+            "zero": zero,
+            "control_error": control_error,
             "success_ee_z_min": self.SUCCESS_EE_Z_MIN,
             "success_ee_z_max": self.SUCCESS_EE_Z_MAX,
-            "success_ee_vel_max": self.SUCCESS_EE_VEL_MAX,
-            "success_reward": self.SUCCESS_REWARD,
-            "alive_penalty": self.ALIVE_PENALTY,
-            "timeout_penalty": self.TIMEOUT_PENALTY,
-            "fail_penalty": self.fail_penalty(),
             "success_required_steps": self.SUCCESS_REQUIRED_STEPS,
             "ee_hold_z_target": self.EE_HOLD_Z_TARGET,
             "ee_hold_z_tolerance": self.EE_HOLD_Z_TOLERANCE,
@@ -254,11 +228,6 @@ class FrankaEnvParallel:
             "pulse_length": self.PULSE_LENGTH,
             "pulse_length_random_min": self.PULSE_LENGTH_RANDOM_MIN,
             "pulse_length_random_max": self.PULSE_LENGTH_RANDOM_MAX,
-            "pulse_start_min_steps": self.PULSE_START_MIN_STEPS,
-            "pulse_lockout_duration": self.PULSE_LOCKOUT_DURATION,
-            "vel_sign_flip_penalty_per_mps": self.VEL_SIGN_FLIP_PENALTY_PER_MPS,
-            "z_acc_penalty_threshold": self.Z_ACC_PENALTY_THRESHOLD,
-            "z_acc_penalty_weight": self.Z_ACC_PENALTY_WEIGHT,
             "finger_gain_random_min": self.FINGER_GAIN_RANDOM_MIN,
             "finger_gain_random_max": self.FINGER_GAIN_RANDOM_MAX,
         }
@@ -274,16 +243,14 @@ class FrankaEnvParallel:
         self.jacobian_regularizer = reg  # (6, 6)
 
         # ------------------------------------------------------------------ #
-        # 2nd-order low-pass filter: H(s) = 5625 / (s² + 49.5 s + 5625)      #
-        # wn = 75 rad/s, zeta = 0.33: ~13 ms of command lag and visible overshoot, #
-        # tuned against the real arm with examples/rigid/tune_ee_vel_controller.py #
+        # 2nd-order low-pass filter: H(s) = 9025 / (s² + 100.8 s + 9025)     #
         # Discretised via bilinear (Tustin) transform at the sim rate T=dt.   #
         # Runs at 1000 Hz inside _control_once().                              #
         # ------------------------------------------------------------------ #
         _T   = self.dt
         _k   = 2.0 / _T
-        _wn2 = 5625.0   # wn = 75 rad/s
-        _blin = 49.5    # 2 * zeta * wn, zeta = 0.33
+        _wn2 = 160000.0
+        _blin = 490.0
         _a0  = _k**2 + _blin * _k + _wn2
         self._filt_b0 =  _wn2 / _a0
         self._filt_b1 = (2.0 * _wn2) / _a0
@@ -427,12 +394,16 @@ class FrankaEnvParallel:
             self._gripper_pulse_delays = torch.full((N,), self.PULSE_DELAY_STEPS, dtype=torch.long, device=self.device)
             self._gripper_pulse_lengths = torch.full((N,), self.PULSE_LENGTH, dtype=torch.long, device=self.device)
             self._prev_gripper_avg = torch.full((N,), self.gripper_pos_min.mean().item(), device=self.device)
-            # Steps since the last pulse trigger. Gates the lockout; starts "expired" so the
-            # first pulse can fire at once.
-            self._pulse_lockout_steps = max(
-                1, int(round(self.PULSE_LOCKOUT_DURATION / self.target_period)))
-            self._steps_since_pulse = torch.full(
-                (N,), self._pulse_lockout_steps + 1, dtype=torch.long, device=self.device)
+            # Optional post-pulse zero-action hold state
+            self._zero_hold_steps = torch.full(
+                (N,),
+                max(1, int(round(self.ZERO_HOLD_DURATION_MIN / self.target_period))),
+                dtype=torch.long,
+                device=self.device,
+            )
+            self._zero_hold_countdown = torch.zeros(N, dtype=torch.long, device=self.device)
+            self._zero_wait_for_direction_change = torch.zeros(N, dtype=torch.bool, device=self.device)
+            self._prev_policy_z_vel_sign = torch.zeros(N, dtype=torch.long, device=self.device)
             # Post-pulse hold countdown: high-level steps remaining in the hold window
             _delay_hl_steps = max(1, int(round(self.POST_PULSE_DELAY_DURATION / self.target_period)))
             _hold_hl_steps = max(1, int(round(self.POST_PULSE_HOLD_DURATION / self.target_period)))
@@ -440,10 +411,21 @@ class FrankaEnvParallel:
             self._post_pulse_hold_total = _hold_hl_steps
             self._post_pulse_delay_countdown = torch.zeros(N, dtype=torch.long, device=self.device)
             self._post_pulse_hold_countdown = torch.zeros(N, dtype=torch.long, device=self.device)
+            # Observation histories (oldest -> newest)
+            self._z_improve_hist = torch.zeros(N, self.HISTORY_LEN, device=self.device)
+            self._pulse_to_next_neg_vel_ms_hist = torch.zeros(N, self.HISTORY_LEN, device=self.device)
+            self._pulse_to_last_neg_vel_ms_hist = torch.zeros(N, self.HISTORY_LEN, device=self.device)
+            # Per-pulse transient state for timing extraction
+            self._pulse_open_start_ms = torch.zeros(N, device=self.device)
+            self._pulse_open_active = torch.zeros(N, dtype=torch.bool, device=self.device)
+            self._current_pulse_next_neg_ms = torch.full((N,), -1.0, device=self.device)
+            self._current_pulse_last_neg_ms = torch.full((N,), -1.0, device=self.device)
             # Cubic-hermite segment state per env
             self._seg_start = None   # (N, 3): (z, z_vel, z_acc)
             self._seg_end = None     # (N, 3)
             self._seg_t0 = torch.zeros(N, device=self.device)  # wall-time at segment start
+            # Per-episode control-error bias added to policy z-velocity command
+            self._episode_control_error = torch.zeros(N, device=self.device)
 
         # Warmup first so ee_link.get_pos() is valid
         for _ in range(warmup_steps):
@@ -463,7 +445,7 @@ class FrankaEnvParallel:
         self.prev_target_z_vel[envs_idx] = 0.0
         self.direction_change_count[envs_idx] = 0
         _n = len(envs_idx)
-        _mag = 0.01 + torch.rand(_n, device=self.device) * 0.01   # uniform in [0.01, 0.04]
+        _mag = 0.02 + torch.rand(_n, device=self.device) * 0.02   # uniform in [0.01, 0.04]
         # _mag = 0.0375
         if self.mix:
             _sign = torch.where(torch.rand(_n, device=self.device) < 0.5,
@@ -495,17 +477,28 @@ class FrankaEnvParallel:
         self._gripper_pulse_steps[envs_idx] = 0
         self._sample_gripper_pulse_delays(envs_idx)
         self._sample_gripper_pulse_lengths(envs_idx)
+        self._sample_zero_hold_steps(envs_idx)
         self._randomize_finger_gains(envs_idx)
         self._prev_gripper_avg[envs_idx] = self.gripper_pos_min.mean()
+        self._zero_hold_countdown[envs_idx] = 0
+        self._zero_wait_for_direction_change[envs_idx] = False
+        self._prev_policy_z_vel_sign[envs_idx] = 0
         self._post_pulse_delay_countdown[envs_idx] = 0
         self._post_pulse_hold_countdown[envs_idx] = 0
-        self._steps_since_pulse[envs_idx] = self._pulse_lockout_steps + 1
+        self._z_improve_hist[envs_idx] = 0.0
+        self._pulse_to_next_neg_vel_ms_hist[envs_idx] = 0.0
+        self._pulse_to_last_neg_vel_ms_hist[envs_idx] = 0.0
+        self._pulse_open_start_ms[envs_idx] = 0.0
+        self._pulse_open_active[envs_idx] = False
+        self._current_pulse_next_neg_ms[envs_idx] = -1.0
+        self._current_pulse_last_neg_ms[envs_idx] = -1.0
 
         self._seg_start = None
         self._seg_end = None
         self._seg_t0 = torch.zeros(N, device=self.device)
 
         self._randomize_friction(envs_idx)
+        self._sample_control_error(envs_idx)
 
         # ---- initial velocity randomization (domain randomization) ----
         if self.randomize:
@@ -540,10 +533,62 @@ class FrankaEnvParallel:
         if actions.shape != (self.num_envs, self.num_actions):
             raise ValueError(f"actions must be ({self.num_envs}, {self.num_actions}), got {actions.shape}")
 
+        if self.zero:
+            policy_z_vel = actions[:, 0].clamp(-1.0, 1.0) * self.Z_VEL_MAX
+            policy_z_vel_sign = torch.where(
+                policy_z_vel > 1e-4,
+                torch.ones_like(self._prev_policy_z_vel_sign),
+                torch.where(
+                    policy_z_vel < -1e-4,
+                    -torch.ones_like(self._prev_policy_z_vel_sign),
+                    torch.zeros_like(self._prev_policy_z_vel_sign),
+                ),
+            )
+
+            start_zero_hold = (
+                self._zero_wait_for_direction_change
+                & (self._zero_hold_countdown == 0)
+                & (self._prev_policy_z_vel_sign != 0)
+                & (policy_z_vel_sign != 0)
+                & (policy_z_vel_sign != self._prev_policy_z_vel_sign)
+            )
+            self._zero_hold_countdown = torch.where(
+                start_zero_hold,
+                self._zero_hold_steps,
+                self._zero_hold_countdown,
+            )
+            self._zero_wait_for_direction_change = torch.where(
+                start_zero_hold,
+                torch.zeros_like(self._zero_wait_for_direction_change),
+                self._zero_wait_for_direction_change,
+            )
+
+            nonzero_sign = policy_z_vel_sign != 0
+            self._prev_policy_z_vel_sign = torch.where(
+                nonzero_sign,
+                policy_z_vel_sign,
+                self._prev_policy_z_vel_sign,
+            )
+
+            in_zero_hold = self._zero_hold_countdown > 0
+            if torch.any(in_zero_hold):
+                actions = actions.clone()
+                actions[in_zero_hold, 0] = 0.0
+                actions[in_zero_hold, 1:] = -1.0
+                self._zero_hold_countdown = torch.where(
+                    in_zero_hold,
+                    self._zero_hold_countdown - 1,
+                    self._zero_hold_countdown,
+                )
+
         new_z_vel = actions[:, 0].clamp(-1.0, 1.0) * self.Z_VEL_MAX  # (N,)
+        if self.control_error:
+            new_z_vel = new_z_vel + self._episode_control_error
+        new_z_vel = new_z_vel.clamp(-self.Z_VEL_MAX, self.Z_VEL_MAX)
         # Limit acceleration: |Δv| ≤ Z_ACC_MAX * target_period
         max_dv = self.Z_ACC_MAX * self.target_period
         new_z_vel = new_z_vel.clamp(self.target_z_vel - max_dv, self.target_z_vel + max_dv)
+        
         gripper_raw = actions[:, 1:].clamp(-1.0, 1.0)                 # (N, 2)
         gripper_pos = self.gripper_pos_min + (gripper_raw + 1.0) * 0.5 * (self.gripper_pos_max - self.gripper_pos_min)  # (N, 2)
 
@@ -558,25 +603,13 @@ class FrankaEnvParallel:
         _pulse_start = self._gripper_pulse_lengths + self._gripper_pulse_delays
         _gp_mid = (self.gripper_pos_min + self.gripper_pos_max).mean() * 0.5  # scalar midpoint
         _gp_avg = gripper_pos.mean(dim=-1)                                     # (N,)
-        # A pulse is blocked while the lockout runs and during the opening steps of an
-        # episode. The clamp below holds the fingers shut outside pulses, so neither
-        # block can be sidestepped by commanding the gripper open directly.
-        _pulse_blocked = (
-            (self._steps_since_pulse < self._pulse_lockout_steps)
-            | (self.episode_length_buf < self.PULSE_START_MIN_STEPS)
-        )  # (N,)
         _rising = (
             (self._prev_gripper_avg < _gp_mid)
             & (_gp_avg >= _gp_mid)
             & (self._gripper_pulse_steps == 0)
-            & (~_pulse_blocked)
-        )  # (N,) rising-edge crossing, no active pulse, nothing blocking
+        )  # (N,) rising-edge crossing with no active pulse
         self._gripper_pulse_steps = torch.where(
             _rising, _pulse_start, self._gripper_pulse_steps
-        )
-        # Trigger restarts the clock the lockout and the magnified window both read.
-        self._steps_since_pulse = torch.where(
-            _rising, torch.zeros_like(self._steps_since_pulse), self._steps_since_pulse
         )
         _gp_max_b = self.gripper_pos_max.unsqueeze(0).expand(self.num_envs, -1)  # (N, 2)
         _gp_min_b = self.gripper_pos_min.unsqueeze(0).expand(self.num_envs, -1)  # (N, 2)
@@ -584,18 +617,29 @@ class FrankaEnvParallel:
             self._gripper_pulse_steps <= self._gripper_pulse_lengths
         )
         _in_close = self._gripper_pulse_steps == 1
-        # Clamp: whenever no pulse is running the fingers are held fully closed, whatever
-        # the policy asks. The finger action is therefore only a pulse trigger: it can
-        # neither open the gripper directly nor loosen the squeeze below full force.
-        _locked_out = self._gripper_pulse_steps == 0  # (N,)
+        _step_start_ms = self.sim_step * self.dt * 1000.0
+        _open_start = _in_open & (~self._pulse_open_active)
+        self._pulse_open_start_ms = torch.where(
+            _open_start,
+            torch.full_like(self._pulse_open_start_ms, _step_start_ms),
+            self._pulse_open_start_ms,
+        )
+        self._current_pulse_next_neg_ms = torch.where(
+            _open_start,
+            torch.full_like(self._current_pulse_next_neg_ms, -1.0),
+            self._current_pulse_next_neg_ms,
+        )
+        self._current_pulse_last_neg_ms = torch.where(
+            _open_start,
+            torch.full_like(self._current_pulse_last_neg_ms, -1.0),
+            self._current_pulse_last_neg_ms,
+        )
+        self._pulse_open_active = _in_open
         gripper_pos = torch.where(
             _in_open.unsqueeze(-1), _gp_max_b,
-            torch.where((_in_close | _locked_out).unsqueeze(-1), _gp_min_b, gripper_pos),
+            torch.where(_in_close.unsqueeze(-1), _gp_min_b, gripper_pos),
         )
-        # Edge detection remembers the EFFECTIVE command, not the raw request. A policy that
-        # holds "open" across the whole lockout therefore still produces a rising edge the
-        # moment the lockout expires, instead of silently opening the fingers with no pulse.
-        self._prev_gripper_avg = gripper_pos.mean(dim=-1)
+        self._prev_gripper_avg = _gp_avg
         # Detect pulse completion (close step, about to go 1 → 0) → start hold window
         _pulse_just_completed = _in_close  # (N,) True on the final close step
         self._post_pulse_delay_countdown = torch.where(
@@ -608,6 +652,12 @@ class FrankaEnvParallel:
             torch.full_like(self._post_pulse_hold_countdown, self._post_pulse_hold_total),
             self._post_pulse_hold_countdown,
         )
+        if self.zero:
+            self._zero_wait_for_direction_change = torch.where(
+                _pulse_just_completed,
+                torch.ones_like(self._zero_wait_for_direction_change),
+                self._zero_wait_for_direction_change,
+            )
         self._gripper_pulse_steps = (self._gripper_pulse_steps - 1).clamp(min=0)
 
         # Trapezoid integration for z
@@ -638,6 +688,58 @@ class FrankaEnvParallel:
                 refresh_visualizer=refresh_visualizer,
             )
 
+        ee_vel_z_step = self.ee_link.get_vel()[:, 2]
+        _step_end_ms = (self.sim_step + self.target_update_every) * self.dt * 1000.0
+        _elapsed_ms = (_step_end_ms - self._pulse_open_start_ms).clamp(min=0.0)
+        _neg_vel_now = ee_vel_z_step < 0.0
+        _next_neg_mask = _in_open & _neg_vel_now & (self._current_pulse_next_neg_ms < 0.0)
+        self._current_pulse_next_neg_ms = torch.where(
+            _next_neg_mask,
+            _elapsed_ms,
+            self._current_pulse_next_neg_ms,
+        )
+        _last_neg_mask = _in_open & _neg_vel_now
+        self._current_pulse_last_neg_ms = torch.where(
+            _last_neg_mask,
+            _elapsed_ms,
+            self._current_pulse_last_neg_ms,
+        )
+
+        if torch.any(_pulse_just_completed):
+            _next_ms = torch.where(
+                self._current_pulse_next_neg_ms >= 0.0,
+                self._current_pulse_next_neg_ms,
+                torch.zeros_like(self._current_pulse_next_neg_ms),
+            )
+            _last_ms = torch.where(
+                self._current_pulse_last_neg_ms >= 0.0,
+                self._current_pulse_last_neg_ms,
+                torch.zeros_like(self._current_pulse_last_neg_ms),
+            )
+            self._push_history(self._pulse_to_next_neg_vel_ms_hist, _next_ms, _pulse_just_completed)
+            self._push_history(self._pulse_to_last_neg_vel_ms_hist, _last_ms, _pulse_just_completed)
+            # print(f"Pulse completed: next_neg_ms={_next_ms[_pulse_just_completed]}, last_neg_ms={_last_ms[_pulse_just_completed]}")
+            self._pulse_open_start_ms = torch.where(
+                _pulse_just_completed,
+                torch.zeros_like(self._pulse_open_start_ms),
+                self._pulse_open_start_ms,
+            )
+            self._pulse_open_active = torch.where(
+                _pulse_just_completed,
+                torch.zeros_like(self._pulse_open_active),
+                self._pulse_open_active,
+            )
+            self._current_pulse_next_neg_ms = torch.where(
+                _pulse_just_completed,
+                torch.full_like(self._current_pulse_next_neg_ms, -1.0),
+                self._current_pulse_next_neg_ms,
+            )
+            self._current_pulse_last_neg_ms = torch.where(
+                _pulse_just_completed,
+                torch.full_like(self._current_pulse_last_neg_ms, -1.0),
+                self._current_pulse_last_neg_ms,
+            )
+
         self.sim_step += self.target_update_every
         self.episode_length_buf += 1
         done, reward, timeout = self._compute_done_and_reward()
@@ -662,12 +764,6 @@ class FrankaEnvParallel:
         left_ft = self._fingertip_pos(self.left_finger)    # (N, 3)
         right_ft = self._fingertip_pos(self.right_finger)  # (N, 3)
 
-        link_forces = self.franka.get_links_net_contact_force()  # (N, n_links, 3)
-        left_force = link_forces[:, self.left_finger.idx_local, :]   # (N, 3)
-        right_force = link_forces[:, self.right_finger.idx_local, :]  # (N, 3)
-        left_force_mag = left_force.norm(dim=-1, keepdim=True)    # (N, 1)
-        right_force_mag = right_force.norm(dim=-1, keepdim=True)  # (N, 1)
-
         finger_mid = (left_ft + right_ft) / 2.0  # (N, 3)
         _noise_range = 0.003 if self.randomize else 0.0
         _N = self.num_envs
@@ -680,17 +776,14 @@ class FrankaEnvParallel:
             ee_vel[:, 2:3]  + _unoise((_N, 1)),                                     # [1]    ee_vel_z
             self.target_z_vel.unsqueeze(-1),                                         # [2]    target_z_vel
             self.target_z_acc.unsqueeze(-1),                                         # [3]    target_z_acc
-            left_force_mag,                                                          # [4]    left_force_mag
-            right_force_mag,                                                         # [5]    right_force_mag
-            (cuboid_pos[:, 2] - finger_mid[:, 2]).unsqueeze(-1) + _unoise((_N, 1)), # [6]    cuboid_rel_z
-            (cuboid_pos[:, 0] - finger_mid[:, 0]).unsqueeze(-1) + _unoise((_N, 1)), # [7]    cuboid_rel_x
-            (cuboid_pos[:, 1] - finger_mid[:, 1]).unsqueeze(-1) + _unoise((_N, 1)), # [8]    cuboid_rel_y
-            self.desired_rel_z.unsqueeze(-1),                                        # [9]    desired_rel_z
-            # TODO: Future observations to be appended here:
-            # [10] last_pulse_gap_z_improve: LAST PULSE GAP z improvement
-            # [11] pulse_gap_duration: duration of gap derived from finger pos
-            # [12] acc_drop_to_open_delay: delay (ms) from EE acceleration going below -10.0 to EE open (can be +/-)
-        ], dim=-1)  # (N, 10)
+            (cuboid_pos[:, 2] - finger_mid[:, 2]).unsqueeze(-1) + _unoise((_N, 1)), # [4]    cuboid_rel_z
+            (cuboid_pos[:, 0] - finger_mid[:, 0]).unsqueeze(-1) + _unoise((_N, 1)), # [5]    cuboid_rel_x
+            (cuboid_pos[:, 1] - finger_mid[:, 1]).unsqueeze(-1) + _unoise((_N, 1)), # [6]    cuboid_rel_y
+            self.desired_rel_z.unsqueeze(-1),                                        # [7]    desired_rel_z
+            self._z_improve_hist,                                                    # [8:10]
+            self._pulse_to_next_neg_vel_ms_hist,                                    # [10:12]
+            self._pulse_to_last_neg_vel_ms_hist,                                    # [12:14]
+        ], dim=-1)  # (N, 14)
 
         if self.normalize:
             if not hasattr(self, '_obs_scale_t'):
@@ -710,23 +803,10 @@ class FrankaEnvParallel:
     # Done detection and partial reset                                    #
     # ------------------------------------------------------------------ #
 
-    def fail_penalty(self) -> float:
-        """Smallest-plus-margin fail cost that is always worse than timing out.
-
-        Failing at step t costs ALIVE*(t-1) + F, timing out costs ALIVE*(L-1) + TIMEOUT.
-        F > TIMEOUT + ALIVE*L makes the first larger for every t >= 1.
-        """
-        return (
-            self.TIMEOUT_PENALTY
-            + self.ALIVE_PENALTY * self.max_episode_length
-            + self.FAIL_PENALTY_MARGIN
-        )
-
     def _compute_done_and_reward(self) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """
         Simple 3-term reward:
-          1. Terminal:       success +SUCCESS_REWARD (minus time penalty), timeout
-                             -TIMEOUT_PENALTY, fail -fail_penalty() (always worse than timeout)
+          1. Terminal:       success +1000 (minus small time penalty), fail/timeout -250
           2. Regrasp bonus:  up to +250 per regrasp, ONLY if z_error improved; zero otherwise
           3. Jerk penalty:   -0.5 * (Δv / Z_VEL_MAX)^2 per step
 
@@ -767,19 +847,19 @@ class FrankaEnvParallel:
         success_candidate = (
             (~timeout)
             & ((cuboid_rel_z - self.desired_rel_z).abs() <= 0.005)
-            & (ee_vel_z.abs() < self.SUCCESS_EE_VEL_MAX)
+            & (ee_vel_z.abs() < 0.02)
             & (self._firm_grasp_steps >= 3)
             & (ee_z >= self.SUCCESS_EE_Z_MIN)
             & (ee_z <= self.SUCCESS_EE_Z_MAX)
         )
-        # Named so the training table can report which one ends each episode.
-        fail_rel_x     = cuboid_rel_x.abs() > 0.04
-        fail_rel_y     = cuboid_rel_y.abs() > 0.04
-        fail_fingertip = fingertip_dist < 0.01
-        fail_rel_z     = cuboid_rel_z.abs() > 0.15
-        fail_ee_low    = ee_z < 0.6
-        fail_ee_high   = ee_z > 0.96
-        fail = fail_rel_x | fail_rel_y | fail_fingertip | fail_rel_z | fail_ee_low | fail_ee_high
+        fail = (
+            (cuboid_rel_x.abs() > 0.04)
+            | (cuboid_rel_y.abs() > 0.04)
+            | (fingertip_dist < 0.01)
+            | (cuboid_rel_z.abs() > 0.15)
+            | (ee_z < 0.6)
+            | (ee_z > 0.96)
+        )
 
         # ---- regrasp event tracking ----
         firm_grasp     = firm_grasp_now                                # (N,)
@@ -824,6 +904,8 @@ class FrankaEnvParallel:
         z_err_before  = (self._release_cuboid_rel_z - self.desired_rel_z).abs()  # (N,)
         z_err_after   = (cuboid_rel_z               - self.desired_rel_z).abs()  # (N,)
         z_improvement = z_err_before - z_err_after                               # (N,) positive = closer
+        self._push_history(self._z_improve_hist, z_improvement, regrasp_event)
+        # print(f"z_improvement: {z_improvement.mean().item():.4f}, z_err_before: {z_err_before.mean().item():.4f}, z_err_after: {z_err_after.mean().item():.4f}")    
         raw_regrasp_bonus = (z_improvement.clamp(min=-0.05) * 15000.0).clamp(max=250.0)
         raw_regrasp_bonus = torch.where(
             raw_regrasp_bonus < 0.0,
@@ -840,47 +922,17 @@ class FrankaEnvParallel:
         # ---- jerk penalty: penalise jerky EE velocity commands ----
         jerk         = (self.target_z_vel - self.prev_target_z_vel) / self.Z_VEL_MAX  # (N,)
         # jerk_penalty = torch.where(fully_released, torch.zeros_like(jerk), -1.0 * jerk.pow(2))  # (N,)
-        jerk_penalty = -0.2 * jerk.pow(2)
-
-        # ---- commanded-velocity sign flips ----
-        # Charged at every step the commanded z velocity reverses, in proportion to how far
-        # apart the two samples are. torch.sign is 0 at exactly zero, so a product below zero
-        # means both samples are non-zero and point opposite ways.
-        _sign_flip = (torch.sign(self.prev_target_z_vel) * torch.sign(self.target_z_vel)) < 0
-        _flip_jump = (self.target_z_vel - self.prev_target_z_vel).abs()          # (N,) m/s
-        self.direction_change_count = self.direction_change_count + _sign_flip.long()
-        vel_sign_flip_penalty = (
-            -self.VEL_SIGN_FLIP_PENALTY_PER_MPS * _flip_jump * _sign_flip.float()
-        )  # (N,)
-
-        # ---- vertical acceleration penalty ----
-        # Only the commanded acceleration beyond Z_ACC_PENALTY_THRESHOLD costs anything,
-        # normalised by Z_ACC_MAX so the term is dimensionless like the jerk penalty.
-        # Same weight at every step, with or without the pulse lockout.
-        _acc_excess = (
-            (self.target_z_acc.abs() - self.Z_ACC_PENALTY_THRESHOLD).clamp(min=0.0)
-            / self.Z_ACC_MAX
-        )  # (N,)
-        z_acc_penalty = -self.Z_ACC_PENALTY_WEIGHT * _acc_excess.pow(2)  # (N,)
-
-        # Advance the trigger clock, capped one past the lockout so the counter cannot
-        # grow without bound.
-        self._steps_since_pulse = (self._steps_since_pulse + 1).clamp(
-            max=self._pulse_lockout_steps + 1)
+        jerk_penalty = -0.2 * jerk.pow(2)       
 
         # ---- terminal reward (dominates with gamma=0.99) ----
         ep = self.episode_length_buf.float()
         base_reward = torch.where(
             success,
-            self.SUCCESS_REWARD - ep * self.SUCCESS_TIME_PENALTY,
+            3000.0 - ep * 0.5,                          # up to 3000; small time penalty
             torch.where(
-                fail,                                     # checked before timeout: fail wins
-                torch.full_like(ee_z, -self.fail_penalty()),
-                torch.where(
-                    timeout,
-                    torch.full_like(ee_z, -self.TIMEOUT_PENALTY),
-                    torch.full_like(ee_z, -self.ALIVE_PENALTY),   # urgency to finish
-                ),
+                fail | timeout,
+                torch.full_like(ee_z, -250.0),
+                torch.full_like(ee_z, -1.25),             # alive penalty: urgency to finish
             ),
         )
 
@@ -907,43 +959,22 @@ class FrankaEnvParallel:
         )
         self._post_pulse_delay_countdown = (self._post_pulse_delay_countdown - 1).clamp(min=0)
 
-        _w = self.REWARD_TERM_WEIGHTS
-        reward = (
-            _w["base_reward"] * base_reward
-            + _w["regrasp_bonus"] * regrasp_bonus
-            + _w["jerk_penalty"] * jerk_penalty
-            + _w["z_acc_penalty"] * z_acc_penalty
-            + _w["vel_sign_flip_penalty"] * vel_sign_flip_penalty
-            + _w["post_pulse_hold_penalty"] * post_pulse_hold_penalty
-        )
+        reward = base_reward + regrasp_bonus*2.0 + jerk_penalty + post_pulse_hold_penalty
 
         self.last_reward_terms = {
             "base_reward":   base_reward.detach().clone(),
             "regrasp_bonus": regrasp_bonus.detach().clone(),
             "jerk_penalty":  jerk_penalty.detach().clone(),
-            "z_acc_penalty": z_acc_penalty.detach().clone(),
-            "vel_sign_flip_penalty": vel_sign_flip_penalty.detach().clone(),
-            "direction_change_count": self.direction_change_count.float().detach().clone(),
             "z_improvement": z_improvement.detach().clone(),
             "avg_force":     avg_force.detach().clone(),
             "regrasp_event": regrasp_event.float().detach().clone(),
+            "success": success.float().detach().clone(),
+            "fail": fail.float().detach().clone(),
+            "timeout": timeout.float().detach().clone(),
+            "done": done.float().detach().clone(),
             "success_candidate": success_candidate.float().detach().clone(),
             "success_steps": self._success_steps.float().detach().clone(),
             "post_pulse_hold_penalty": post_pulse_hold_penalty.detach().clone(),
-            # ep_* keys describe how an episode ended. They are read by the training
-            # table only on the step an env terminates, never averaged per step.
-            "ep_done":              done.float(),
-            "ep_success":           success.float(),
-            "ep_fail":              fail.float(),
-            "ep_timeout":           (timeout & ~fail & ~success).float(),
-            "ep_length":            self.episode_length_buf.float(),
-            "ep_fail_rel_x":        fail_rel_x.float(),
-            "ep_fail_rel_y":        fail_rel_y.float(),
-            "ep_fail_fingertip":    fail_fingertip.float(),
-            "ep_fail_rel_z":        fail_rel_z.float(),
-            "ep_fail_ee_low":       fail_ee_low.float(),
-            "ep_fail_ee_high":      fail_ee_high.float(),
-            "ep_fail_regrasp_limit": limit_fail.float(),
         }
 
         return done, reward, timeout
@@ -965,7 +996,7 @@ class FrankaEnvParallel:
         self.prev_target_z_vel[envs_idx] = 0.0
         self.direction_change_count[envs_idx] = 0
         _n = len(envs_idx)
-        _mag = 0.01 + torch.rand(_n, device=self.device) * 0.01   # uniform in [0.02, 0.04]
+        _mag = 0.02 + torch.rand(_n, device=self.device) * 0.02   # uniform in [0.02, 0.04]
         if self.mix:
             _sign = torch.where(torch.rand(_n, device=self.device) < 0.5,
                                 torch.ones(_n, device=self.device),
@@ -993,12 +1024,23 @@ class FrankaEnvParallel:
         self._gripper_pulse_steps[envs_idx] = 0
         self._sample_gripper_pulse_delays(envs_idx)
         self._sample_gripper_pulse_lengths(envs_idx)
+        self._sample_zero_hold_steps(envs_idx)
         self._randomize_finger_gains(envs_idx)
         self._prev_gripper_avg[envs_idx] = self.gripper_pos_min.mean()
+        self._zero_hold_countdown[envs_idx] = 0
+        self._zero_wait_for_direction_change[envs_idx] = False
+        self._prev_policy_z_vel_sign[envs_idx] = 0
         self._post_pulse_delay_countdown[envs_idx] = 0
         self._post_pulse_hold_countdown[envs_idx] = 0
-        self._steps_since_pulse[envs_idx] = self._pulse_lockout_steps + 1
+        self._z_improve_hist[envs_idx] = 0.0
+        self._pulse_to_next_neg_vel_ms_hist[envs_idx] = 0.0
+        self._pulse_to_last_neg_vel_ms_hist[envs_idx] = 0.0
+        self._pulse_open_start_ms[envs_idx] = 0.0
+        self._pulse_open_active[envs_idx] = False
+        self._current_pulse_next_neg_ms[envs_idx] = -1.0
+        self._current_pulse_last_neg_ms[envs_idx] = -1.0
         self._randomize_friction(envs_idx)
+        self._sample_control_error(envs_idx)
 
         # ---- initial velocity randomization (domain randomization) ----
         if self.randomize:
@@ -1060,6 +1102,41 @@ class FrankaEnvParallel:
         else:
             self._gripper_pulse_lengths[envs_idx] = self.PULSE_LENGTH
 
+    def _sample_control_error(self, envs_idx: torch.Tensor):
+        """Set a per-env constant z-velocity command bias for the whole episode."""
+        if self.control_error:
+            n = len(envs_idx)
+            mag = self.CONTROL_ERROR_ABS_MIN + torch.rand(n, device=self.device) * (
+                self.CONTROL_ERROR_ABS_MAX - self.CONTROL_ERROR_ABS_MIN
+            )
+            sign = torch.where(
+                torch.rand(n, device=self.device) < 0.5,
+                -torch.ones(n, device=self.device),
+                torch.ones(n, device=self.device),
+            )
+            # self._episode_control_error[envs_idx] = sign * mag
+            self._episode_control_error[envs_idx] = - mag
+        else:
+            self._episode_control_error[envs_idx] = 0.0
+
+    def _sample_zero_hold_steps(self, envs_idx: torch.Tensor):
+        """Set per-env zero-hold duration in high-level steps.
+
+        If randomization is enabled, sample duration uniformly in [0.1s, 0.3s].
+        Otherwise, use the fixed minimum duration (0.1s).
+        """
+        if self.randomize:
+            duration_s = (
+                self.ZERO_HOLD_DURATION_MIN
+                + torch.rand(len(envs_idx), device=self.device)
+                * (self.ZERO_HOLD_DURATION_MAX - self.ZERO_HOLD_DURATION_MIN)
+            )
+            steps = torch.round(duration_s / self.target_period).to(dtype=torch.long)
+            self._zero_hold_steps[envs_idx] = torch.clamp(steps, min=1)
+        else:
+            fixed_steps = max(1, int(round(self.ZERO_HOLD_DURATION_MIN / self.target_period)))
+            self._zero_hold_steps[envs_idx] = fixed_steps
+
     def _randomize_finger_gains(self, envs_idx: torch.Tensor):
         """Sample one shared finger value per env and apply it with preserved signs."""
         n = len(envs_idx)
@@ -1091,7 +1168,7 @@ class FrankaEnvParallel:
         target_pos = self.target_center.clone()          # (N, 3)
         target_pos[:, 2] = target_z
         target_vel = torch.zeros(N, 3, device=self.device)
-        # 2nd-order low-pass filter: H(s) = 5625 / (s² + 49.5 s + 5625) at 1000 Hz
+        # 2nd-order low-pass filter: H(s) = 9025 / (s² + 100.8 s + 9025) at 1000 Hz
         # y[n] = b0*u[n] + b1*u[n-1] + b2*u[n-2] - a1*y[n-1] - a2*y[n-2]
         _u_n = target_z_vel
         target_z_vel = (
@@ -1180,6 +1257,14 @@ class FrankaEnvParallel:
     # Internal: utilities                                                 #
     # ------------------------------------------------------------------ #
 
+    def _push_history(self, hist: torch.Tensor, values: torch.Tensor, mask: torch.Tensor):
+        """Push scalar values into per-env fixed-length histories (oldest -> newest)."""
+        idx = mask.nonzero(as_tuple=False).squeeze(-1)
+        if idx.numel() == 0:
+            return
+        hist[idx, :-1] = hist[idx, 1:].clone()
+        hist[idx, -1] = values[idx]
+
     def _fingertip_pos(self, finger_link) -> torch.Tensor:
         """Compute fingertip world position (N, 3) from link pose."""
         pos = finger_link.get_pos()    # (N, 3)
@@ -1220,8 +1305,7 @@ class FrankaEnvParallel:
     def _set_franka_gains(self):
         kp_motors = torch.tensor([4500, 4500, 3500, 3500, 2000, 2000, 2000],
                                   dtype=torch.float32, device=self.device)
-        # 0.35 x the nominal [450 450 350 350 200 200 200], tuned for real-arm-like lag
-        kv_motors = torch.tensor([157.5, 157.5, 122.5, 122.5, 70.0, 70.0, 70.0],
+        kv_motors = torch.tensor([450, 450, 350, 350, 200, 200, 200],
                                   dtype=torch.float32, device=self.device)
         f_lo = torch.tensor([-87, -87, -87, -87, -12, -12, -12],
                              dtype=torch.float32, device=self.device)
@@ -1254,11 +1338,17 @@ if __name__ == "__main__":
     parser.add_argument("--vis", action="store_true")
     parser.add_argument("--steps", type=int, default=50)
     parser.add_argument("--limit-regrasp", action="store_true")
+    parser.add_argument("--control-error", action="store_true")
     args = parser.parse_args()
 
     gs.init(backend=gs.gpu, precision="32", logging_level="warning")
 
-    env = FrankaEnvParallel(num_envs=args.num_envs, vis=args.vis, limit_regrasp=args.limit_regrasp)
+    env = FrankaEnvParallel(
+        num_envs=args.num_envs,
+        vis=args.vis,
+        limit_regrasp=args.limit_regrasp,
+        control_error=args.control_error,
+    )
     obs_td = env.reset()
     print("obs shape:", obs_td["policy"].shape)
     print("obs_dim:", FrankaEnvParallel.OBS_DIM)

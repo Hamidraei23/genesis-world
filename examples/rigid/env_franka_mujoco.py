@@ -38,12 +38,13 @@ class FrankaMuJoCoEnv:
     Z_ACC_MAX = 15.00
     Z_ACC_PENALTY_THRESHOLD = 13.0
     Z_ACC_PENALTY_WEIGHT = 0.0
-    PULSE_DELAY_STEPS = 3   # target-period steps to wait before the open window begins
+    PULSE_DELAY_STEPS = 2   # target-period steps to wait before the open window begins
+    PULSE_LENGTH = 5        # keep in sync with env_franka_parallel.py: 120 ms open
     ZERO_HOLD_DURATION_MIN = 0.1  # seconds
     ZERO_HOLD_DURATION_MAX = 0.3  # seconds; used when randomize=True
     EE_Z_TARGET = 0.7
     GRIPPER_CLOSED = 0.000251
-    GRIPPER_OPEN = 0.0124
+    GRIPPER_OPEN = 0.0127   # keep in sync with env_franka_parallel.py
     MAX_EPISODE_LENGTH = 450
 
     FORCE_FREE_THRESHOLD = 0.15
@@ -76,7 +77,7 @@ class FrankaMuJoCoEnv:
         render_fps=60,
         playback_speed=1.0,
         gripper_pos_min=0.00000000251,
-        gripper_pos_max=0.0124,
+        gripper_pos_max=0.0127,
         solid_up: bool = False,
         mix: bool = False,
         gravity_compensation: bool = True,
@@ -278,7 +279,7 @@ class FrankaMuJoCoEnv:
         )
 
         # --- GRIPPER PULSE LOGIC ---
-        _pulse_start = 5 + self.PULSE_DELAY_STEPS
+        _pulse_start = self.PULSE_LENGTH + self.PULSE_DELAY_STEPS
         _gp_mid = (np.mean(self.gripper_pos_min) + np.mean(self.gripper_pos_max)) * 0.5
         _gp_avg = np.mean(gripper_pos)
         _rising = (
@@ -289,7 +290,7 @@ class FrankaMuJoCoEnv:
         if _rising:
             self._gripper_pulse_steps = _pulse_start
             
-        if 2 <= self._gripper_pulse_steps <= 6:
+        if 2 <= self._gripper_pulse_steps <= self.PULSE_LENGTH:
             gripper_pos = self.gripper_pos_max.copy()
         elif self._gripper_pulse_steps == 1:
             gripper_pos = self.gripper_pos_min.copy()
