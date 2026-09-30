@@ -962,7 +962,7 @@ class FrankaEnvParallelTiltedNoForce:
             raw_regrasp_bonus * 5.0,
             raw_regrasp_bonus,
         )
-        # raw_regrasp_bonus = raw_regrasp_bonus.clamp(min=-1000.0)
+        raw_regrasp_bonus = raw_regrasp_bonus.clamp(min=-3000.0)
         # Bonus only for the first REGRASP_BONUS_MAX_COUNT regrasps. _regrasp_count was
         # already incremented above, so the k-th regrasp event sees _regrasp_count == k.
         bonus_eligible = regrasp_event & (self._regrasp_count <= self.REGRASP_BONUS_MAX_COUNT)
