@@ -1,0 +1,376 @@
+--- a/examples/rigid/env_franka_parallel_tilted.py
++++ b/examples/rigid/env_franka_parallel_tilted.py
+@@ -156,15 +156,12 @@
+     Z_VEL_MAX = 0.45
+     Z_ACC_MAX = 15.00  # m/s² — hard limit on target-velocity rate of change
+     Z_ACC_PENALTY_THRESHOLD = 0.0
+-    Z_ACC_PENALTY_WEIGHT = 1.5  # 5 x the 1.25 that matched JERK_PENALTY_WEIGHT
+-    # Both terms normalise to the same 2/3 at the acceleration clamp — |Δv| tops out
+-    # at Z_ACC_MAX * target_period = 0.3 against Z_VEL_MAX = 0.45, and the acceleration
+-    # excess tops out at (15 - 5) / 15 — so at saturation they cost 2.78 and 0.56 per
+-    # step respectively: the acceleration term is now worth 5 of this one. Below the
+-    # threshold the acceleration term is free and this one is not, which is the point:
+-    # it charges the whole command sequence, not only its extremes. Was 0.2, which cost
+-    # -4 an episode against the acceleration term's -34 and could not shape anything.
+-    JERK_PENALTY_WEIGHT = 1.5
++    # At the default outer reward weights, saturated alternating acceleration costs
++    # 25 + 25 = 50 per step, or 1500 over 30 unrefunded steps (1481.25 from rest).
++    Z_ACC_PENALTY_WEIGHT = 25.0
++    JERK_PENALTY_WEIGHT = 25.0  # squared acceleration change / (2 * Z_ACC_MAX)
++    SMOOTHNESS_REFUND_STEPS = 6  # preceding charged steps refunded on an accepted pulse trigger
++    SMOOTHNESS_FREE_STEPS_AFTER_PULSE = 8  # firing step is also free: 9 steps total
+     EE_Z_TARGET = 0.7
+     GRIPPER_CLOSED = 0.000251
+     GRIPPER_OPEN = 0.0130  # per finger; gap 26.0 mm clears the 25 mm block by 1.0 mm
+@@ -176,6 +173,7 @@
+     REGRASP_BONUS = 75.0  # duration-weighted reward scale for successful regrasp events
+     REGRASP_TERMINATION_COUNT = 7  # fail on the 7th regrasp if not successful by then
+     REGRASP_BONUS_MAX_COUNT = 4  # regrasp bonus paid only for the first 4 regrasps
++    REGRASP_BONUS_CAP = 10000.0  # positive raw bonus cap, before REWARD_TERM_WEIGHTS
+     FIRM_GRASP_SLIP_PENALTY_WEIGHT = 30.0  # harsh penalty per (m/step)² of Z-slip during firm grasp
+     SUCCESS_EE_Z_MIN = 0.7
+     SUCCESS_EE_Z_MAX = 0.86
+@@ -338,6 +336,9 @@
+             "z_acc_penalty_threshold": self.Z_ACC_PENALTY_THRESHOLD,
+             "z_acc_penalty_weight": self.Z_ACC_PENALTY_WEIGHT,
+             "jerk_penalty_weight": self.JERK_PENALTY_WEIGHT,
++            "smoothness_refund_steps": self.SMOOTHNESS_REFUND_STEPS,
++            "smoothness_free_steps_after_pulse": self.SMOOTHNESS_FREE_STEPS_AFTER_PULSE,
++            "regrasp_bonus_cap": self.REGRASP_BONUS_CAP,
+             "finger_gain_random_min": self.FINGER_GAIN_RANDOM_MIN,
+             "finger_gain_random_max": self.FINGER_GAIN_RANDOM_MAX,
+         }
+@@ -541,6 +542,7 @@
+         self.target_z_vel[envs_idx] = 0.0
+         self.target_z_acc[envs_idx] = 0.0
+         self.prev_target_z_vel[envs_idx] = 0.0
++        self._reset_smoothness_state(envs_idx)
+         self.direction_change_count[envs_idx] = 0
+         _n = len(envs_idx)
+         _mag = 0.015 + torch.rand(_n, device=self.device) * 0.02  # uniform in [0.015, 0.035]
+@@ -654,6 +656,7 @@
+             & (self._gripper_pulse_steps == 0)
+             & (~_pulse_blocked)
+         )  # (N,) rising-edge crossing, no active pulse, nothing blocking
++        self._pulse_fired = _rising
+         self._gripper_pulse_steps = torch.where(_rising, _pulse_start, self._gripper_pulse_steps)
+         # Trigger restarts the clock the lockout and the magnified window both read.
+         self._steps_since_pulse = torch.where(
+@@ -702,6 +705,7 @@
+         self._seg_t0 = torch.full((self.num_envs,), self.sim_step * self.dt, device=self.device)
+ 
+         self.prev_target_z_vel = self.target_z_vel.clone()
++        self.prev_target_z_acc = self.target_z_acc.clone()
+         self.target_z = new_z
+         self.target_z_vel = new_z_vel
+         self.target_z_acc = new_z_acc
+@@ -804,16 +808,55 @@
+         """
+         return self.TIMEOUT_PENALTY + self.ALIVE_PENALTY * self.max_episode_length + self.FAIL_PENALTY_MARGIN
+ 
++    def _reset_smoothness_state(self, envs_idx: torch.Tensor):
++        """Clear history and exemptions only for environments starting a new episode."""
++        if not hasattr(self, "_smoothness_history"):
++            self.prev_target_z_acc = torch.zeros(self.num_envs, device=self.device)
++            self._pulse_fired = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
++            self._smoothness_free_steps = torch.zeros(self.num_envs, dtype=torch.long, device=self.device)
++            self._smoothness_history = torch.zeros(self.num_envs, self.SMOOTHNESS_REFUND_STEPS, 2, device=self.device)
++        self.prev_target_z_acc[envs_idx] = 0.0
++        self._pulse_fired[envs_idx] = False
++        self._smoothness_free_steps[envs_idx] = 0
++        self._smoothness_history[envs_idx] = 0.0
++
++    def _compute_smoothness_penalties(self) -> tuple[torch.Tensor, torch.Tensor]:
++        """Charge acceleration and discrete jerk; refund preparation only on a real trigger.
++
++        History holds actual charges, never refunds, in chronological order. A pulse
++        refunds the preceding six steps once, then exempts the trigger and next eight
++        steps. Refunds cancel undiscounted charges; PPO still discounts delayed rewards.
++        """
++        acc_excess = (self.target_z_acc.abs() - self.Z_ACC_PENALTY_THRESHOLD).clamp(min=0.0)
++        acc_cost = -self.Z_ACC_PENALTY_WEIGHT * (acc_excess / self.Z_ACC_MAX).square()
++        acc_change = (self.target_z_acc - self.prev_target_z_acc) / (2.0 * self.Z_ACC_MAX)
++        jerk_cost = -self.JERK_PENALTY_WEIGHT * acc_change.square()
++        costs = torch.stack((acc_cost, jerk_cost), dim=-1)
++
++        refund = torch.where(self._pulse_fired[:, None], -self._smoothness_history.sum(dim=1), 0.0)
++        self._smoothness_history[self._pulse_fired] = 0.0
++        self._smoothness_free_steps = torch.where(
++            self._pulse_fired,
++            self.SMOOTHNESS_FREE_STEPS_AFTER_PULSE + 1,
++            self._smoothness_free_steps,
++        )
++        costs = torch.where((self._smoothness_free_steps > 0)[:, None], 0.0, costs)
++        self._smoothness_free_steps = (self._smoothness_free_steps - 1).clamp(min=0)
++        self._smoothness_history = torch.roll(self._smoothness_history, shifts=-1, dims=1)
++        self._smoothness_history[:, -1] = costs
++        return (costs + refund).unbind(dim=-1)
++
+     def _compute_done_and_reward(self) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+         """
+-        Simple 3-term reward:
++        Task rewards plus motion costs:
+           1. Terminal:       success +SUCCESS_REWARD (minus time penalty), timeout
+                              -TIMEOUT_PENALTY, fail -fail_penalty() (always worse than timeout)
+-          2. Regrasp bonus:  up to +250 per regrasp, ONLY if z_error improved; zero otherwise
+-          3. Jerk penalty:   -JERK_PENALTY_WEIGHT * (Δv / Z_VEL_MAX)^2 per step
+-
+-        Opening the gripper alone gives no reward — only completing release→regrasp
+-        that moves the cuboid closer to desired_rel_z is rewarded.
++          2. Regrasp bonus:  capped positive improvement bonus; negative if error worsens
++          3. Smoothness:     acceleration and acceleration-change costs with pulse refunds
++          4. Proximity, speed, direction-change and blockade terms as weighted below
++
++        The regrasp bonus requires completing release→regrasp with improved error.
++        A pulse trigger additionally refunds recent smoothness charges, once.
+         Recommended gamma: 0.99 (terminal signal meaningful up to ~200 steps out).
+         """
+         cuboid_pos = self.cuboid.get_pos()  # (N, 3)
+@@ -893,13 +936,14 @@
+         self._regrasp_count += regrasp_event.long()
+ 
+         # ---- regrasp bonus: reward = 0 for opening alone; stronger penalty if z_error got worse ----
+-        # Scale: perfect 30 mm improvement → +250; 0 mm improvement → 0; worse → negative x5.
++        # Positive raw bonus capped at 10000; 0 mm improvement → 0; worse → negative x5.
+         # All distances are along the fixed grasp axis. Gravity in these coordinates
+         # is the projection of world gravity; no vertical free-fall estimate is used.
+         z_err_before = (self._release_cuboid_rel_z - self.desired_rel_z).abs()  # (N,)
+         z_err_after = (cuboid_rel_z - self.desired_rel_z).abs()  # (N,)
+         z_improvement = z_err_before - z_err_after  # (N,) positive = closer
+-        raw_regrasp_bonus = (z_improvement.clamp(min=-0.05) * 15000.0) * (((z_improvement.abs()/ 0.0075)**3))
++        raw_regrasp_bonus = (z_improvement.clamp(min=-0.05) * 7500.0) * ((z_improvement.abs() / 0.0075) ** 3)
++        raw_regrasp_bonus = raw_regrasp_bonus.clamp(max=self.REGRASP_BONUS_CAP)
+         raw_regrasp_bonus = torch.where(
+             raw_regrasp_bonus < 0.0,
+             raw_regrasp_bonus * 5.0,
+@@ -921,11 +965,8 @@
+         proximity_reward = self.PROXIMITY_REWARD_MAX * (_decay - _floor) / (1.0 - _floor)
+         proximity_reward = proximity_reward.clamp(0.0, self.PROXIMITY_REWARD_MAX)  # (N,)
+ 
+-        # ---- command smoothness penalty (historically named jerk_penalty) ----
+-        # Measures velocity changes, not physical jerk (acceleration changes).
+-        jerk = (self.target_z_vel - self.prev_target_z_vel) / self.Z_VEL_MAX  # (N,)
+-        # jerk_penalty = torch.where(fully_released, torch.zeros_like(jerk), -1.0 * jerk.pow(2))  # (N,)
+-        jerk_penalty = -self.JERK_PENALTY_WEIGHT * jerk.pow(2)
++        # These terms include positive refunds on accepted pulse triggers.
++        z_acc_penalty, jerk_penalty = self._compute_smoothness_penalties()
+ 
+         # ---- commanded-velocity sign flips ----
+         # Charged at every step the commanded z velocity reverses, in proportion to how far
+@@ -935,13 +976,6 @@
+         _flip_jump = (self.target_z_vel - self.prev_target_z_vel).abs()  # (N,) m/s
+         self.direction_change_count = self.direction_change_count + _sign_flip.long()
+         vel_sign_flip_penalty = -self.VEL_SIGN_FLIP_PENALTY_PER_MPS * _flip_jump * _sign_flip.float()  # (N,)
+-
+-        # ---- grasp-axis acceleration penalty ----
+-        # Only the commanded acceleration beyond Z_ACC_PENALTY_THRESHOLD costs anything,
+-        # normalised by Z_ACC_MAX so the term is dimensionless like the jerk penalty.
+-        # Same weight at every step, with or without the pulse lockout.
+-        _acc_excess = (self.target_z_acc.abs() - self.Z_ACC_PENALTY_THRESHOLD).abs() / self.Z_ACC_MAX  # (N,)
+-        z_acc_penalty = -self.Z_ACC_PENALTY_WEIGHT * _acc_excess.pow(2)  # (N,)
+ 
+         # ---- grasp-axis speed penalty ----
+         # Measured speed beyond the deadzone, charged at every step of every period. The
+@@ -1072,6 +1106,7 @@
+         self.target_z_vel[envs_idx] = 0.0
+         self.target_z_acc[envs_idx] = 0.0
+         self.prev_target_z_vel[envs_idx] = 0.0
++        self._reset_smoothness_state(envs_idx)
+         self.direction_change_count[envs_idx] = 0
+         _n = len(envs_idx)
+         _mag = 0.015 + torch.rand(_n, device=self.device) * 0.02  # uniform in [0.015, 0.035]
+--- a/examples/rigid/test_env_franka_parallel_tilted.py
++++ b/examples/rigid/test_env_franka_parallel_tilted.py
+@@ -48,6 +48,8 @@
+         env.target_z_vel = torch.tensor([0.0, 0.1, -0.1, 0.2])
+         env.prev_target_z_vel = -env.target_z_vel
+         env.target_z_acc = torch.tensor([0.0, 5.0, 8.0, 10.0])
++        if cls is TiltedEnv:
++            env._reset_smoothness_state(torch.arange(env.num_envs))
+         # Success, transverse drop, timeout, and improving regrasp/hold penalty.
+         ee_task = torch.tensor([[0.0, 0.0, 0.8]]).repeat(4, 1)
+         vel_task = torch.tensor([[0.0, 0.0, 0.0], [0.0, 0.0, 0.1], [0.0, 0.0, -0.1], [0.0, 0.0, 0.2]])
+@@ -85,6 +87,9 @@
+         for angle in (0.0, 15.0, 30.0, 45.0):
+             with self.subTest(angle=angle):
+                 original, tilted = self.make_env(OriginalEnv), self.make_env(TiltedEnv, angle)
++                # Compare frame behavior with matching settings where defaults differ.
++                original.SUCCESS_REWARD = tilted.SUCCESS_REWARD
++                original.VEL_SIGN_FLIP_PENALTY_PER_MPS = tilted.VEL_SIGN_FLIP_PENALTY_PER_MPS
+                 original._update_obs_buf()
+                 tilted._update_obs_buf()
+                 torch.testing.assert_close(tilted.obs_buf, original.obs_buf)
+@@ -94,11 +99,11 @@
+                 expected_done, _, expected_timeout = original._compute_done_and_reward()
+                 torch.testing.assert_close(actual_done, expected_done)
+                 torch.testing.assert_close(actual_timeout, expected_timeout)
+-                # Terms both envs still publish must agree: same formula, rotated frame.
++                # Unchanged terms must agree; regrasp and smoothness now use different formulas.
+                 shared = tilted.last_reward_terms.keys() & original.last_reward_terms.keys()
+                 self.assertIn("regrasp_bonus", shared)
+                 self.assertIn("z_acc_penalty", shared)
+-                for name in shared:
++                for name in shared - {"regrasp_bonus", "z_acc_penalty", "jerk_penalty"}:
+                     torch.testing.assert_close(
+                         tilted.last_reward_terms[name],
+                         original.last_reward_terms[name],
+@@ -179,12 +184,46 @@
+         env = self.make_env(TiltedEnv)
+         _, reward, _ = env._compute_done_and_reward()
+         weights = TiltedEnv.REWARD_TERM_WEIGHTS
+-        self.assertEqual(set(weights), {"base_reward", "proximity_reward", "regrasp_bonus", "z_acc_penalty"})
++        self.assertEqual(
++            set(weights),
++            {
++                "base_reward",
++                "proximity_reward",
++                "regrasp_bonus",
++                "z_acc_penalty",
++                "jerk_penalty",
++                "vel_sign_flip_penalty",
++                "blockade_motion_penalty",
++                "speed_penalty",
++            },
++        )
+         expected = sum(weights[k] * env.last_reward_terms[k] for k in weights)
+         torch.testing.assert_close(reward, expected)
+         # Dropped terms must not linger in the table, or its total would double-count.
+-        for gone in ("jerk_penalty", "vel_sign_flip_penalty", "post_pulse_hold_penalty"):
+-            self.assertNotIn(gone, env.last_reward_terms)
++        self.assertNotIn("post_pulse_hold_penalty", env.last_reward_terms)
++
++    def test_regrasp_scale_cap_and_event_eligibility(self):
++        env = self.make_env(TiltedEnv, angle=0.0)
++        env.desired_rel_z.zero_()
++        midpoint = (env.left_finger.pos + env.right_finger.pos) / 2
++        env.cuboid.get_pos = lambda: midpoint
++        env._release_cuboid_rel_z = torch.tensor([0.01, 0.03, 0.03, 0.03])
++        env._in_release[2] = False  # no release -> regrasp event
++        env._regrasp_count[3] = env.REGRASP_BONUS_MAX_COUNT
++        env._compute_done_and_reward()
++        # 10 mm improvement uses the new 7500 coefficient; 30 mm hits the raw cap.
++        torch.testing.assert_close(env.last_reward_terms["regrasp_bonus"], torch.tensor([177.77778, 10000.0, 0.0, 0.0]))
++
++    def test_regrasp_worsening_keeps_negative_multiplier(self):
++        env = self.make_env(TiltedEnv, angle=0.0)
++        env.desired_rel_z.zero_()
++        env._release_cuboid_rel_z.zero_()
++        midpoint = (env.left_finger.pos + env.right_finger.pos) / 2
++        env.cuboid.get_pos = lambda: midpoint + torch.tensor([0.0, 0.0, 0.01])
++        env._compute_done_and_reward()
++        torch.testing.assert_close(
++            env.last_reward_terms["regrasp_bonus"], torch.full((4,), -888.88889), rtol=1e-4, atol=0.001
++        )
+ 
+     def test_joint_angle_produces_requested_inclination(self):
+         # The home joint-5 axis is not horizontal, so simply setting q5=-tilt
+@@ -219,5 +258,109 @@
+         torch.testing.assert_close(env.task_axes[1], torch.eye(3))
+ 
+ 
++class PulseSmoothnessTests(unittest.TestCase):
++    def make_env(self):
++        env = TiltedEnv.__new__(TiltedEnv)
++        env.num_envs = 2
++        env.device = torch.device("cpu")
++        env.target_z_acc = torch.zeros(2)
++        env._reset_smoothness_state(torch.arange(2))
++        return env
++
++    def advance(self, env, acceleration, fired=(False, False)):
++        env.prev_target_z_acc = env.target_z_acc.clone()
++        env.target_z_acc = torch.tensor(acceleration, dtype=torch.float32)
++        env._pulse_fired = torch.tensor(fired)
++        return torch.stack(env._compute_smoothness_penalties(), dim=-1)
++
++    def test_thirty_step_worst_case_and_constant_acceleration(self):
++        env = self.make_env()
++        total = torch.zeros(2)
++        for step in range(30):
++            terms = self.advance(env, [15.0 * (-1) ** step, 15.0])
++            total += terms.sum(dim=-1)
++            if step > 0:
++                self.assertEqual(terms[0].sum().item(), -50.0)
++                self.assertEqual(terms[1, 1].item(), 0.0)
++        # First acceleration change is 0 -> 15, not -15 -> 15: 18.75 below the bound.
++        torch.testing.assert_close(total, torch.tensor([-1481.25, -756.25]))
++        env = self.make_env()
++        env.target_z_acc.fill_(-15.0)
++        total = 0.0
++        for step in range(30):
++            total += self.advance(env, [15.0 * (-1) ** step, 0.0])[0].sum().item()
++        self.assertEqual(total, -1500.0)
++
++    def test_refund_last_six_steps_and_exact_exemption_boundary(self):
++        env = self.make_env()
++        history = []
++        for step in range(10):
++            value = (6.0 + step) * (-1) ** step
++            history.append(self.advance(env, [value, value]))
++        refund = self.advance(env, [15.0, 15.0], fired=(True, False))
++        torch.testing.assert_close(refund[0], -torch.stack(history[-6:])[:, 0].sum(dim=0))
++        self.assertEqual(refund[1].sum().item(), -50.0)
++        for step in range(8):
++            value = -15.0 * (-1) ** step
++            terms = self.advance(env, [value, value])
++            torch.testing.assert_close(terms[0], torch.zeros(2))
++            self.assertEqual(terms[1].sum().item(), -50.0)
++        terms = self.advance(env, [-15.0, -15.0])
++        torch.testing.assert_close(terms, torch.full((2, 2), -25.0))
++
++    def test_refunded_and_exempt_steps_cannot_be_refunded_again(self):
++        env = self.make_env()
++        self.advance(env, [15.0, 15.0])
++        first = self.advance(env, [-15.0, -15.0], fired=(True, False))
++        torch.testing.assert_close(first[0], torch.tensor([25.0, 6.25]))
++        second = self.advance(env, [15.0, 15.0], fired=(True, False))
++        torch.testing.assert_close(second[0], torch.zeros(2))
++
++    def test_partial_reset_clears_history_exemption_and_previous_acceleration(self):
++        env = self.make_env()
++        self.advance(env, [15.0, 15.0])
++        self.advance(env, [-15.0, -15.0], fired=(True, False))
++        history = env._smoothness_history[1].clone()
++        env._reset_smoothness_state(torch.tensor([0]))
++        self.assertEqual(env.prev_target_z_acc[0].item(), 0.0)
++        self.assertFalse(env._pulse_fired[0].item())
++        self.assertEqual(env._smoothness_free_steps[0].item(), 0)
++        torch.testing.assert_close(env._smoothness_history[0], torch.zeros_like(history))
++        torch.testing.assert_close(env._smoothness_history[1], history)
++        self.assertEqual(env.prev_target_z_acc[1].item(), 15.0)
++
++    def test_only_accepted_trigger_refunds_in_actual_step(self):
++        env = TiltedFrameTests().make_env(TiltedEnv)
++        env.target_z = torch.full((4,), env.HOME_TASK_Z)
++        env.target_z_vel.zero_()
++        env.target_z_acc.zero_()
++        env.gripper_pos_min = torch.full((2,), env.GRIPPER_CLOSED)
++        env.gripper_pos_max = torch.full((2,), env.GRIPPER_OPEN)
++        env._prev_gripper_avg = torch.full((4,), env.GRIPPER_CLOSED)
++        env._gripper_pulse_delays = torch.full((4,), env.PULSE_DELAY_STEPS)
++        env._gripper_pulse_lengths = torch.full((4,), env.PULSE_LENGTH)
++        env._post_pulse_delay_total = env._post_pulse_hold_total = 25
++        # Accepted, blocked by lockout, blocked at episode start, already active.
++        env._steps_since_pulse = torch.tensor([61, 0, 61, 61])
++        env.episode_length_buf = torch.tensor([50, 50, 49, 50])
++        env._gripper_pulse_steps = torch.tensor([0, 0, 0, 2])
++        env._smoothness_history.fill_(-10.0)
++        env.sim_step = 0
++        env.dt = 0.001
++        env.target_update_every = 0  # exercise real step/reward logic without physics
++        env.num_actions = 3
++        env.fingers_dof = torch.tensor([7, 8])
++        env.franka.control_dofs_position = lambda *args, **kwargs: None
++        env._reset_idx = lambda indices: None
++        env._update_obs_buf = lambda: None
++        env.get_observations = lambda: None
++        env.extras = {}
++        env.step(torch.ones(4, 3))
++        self.assertEqual(env._pulse_fired.tolist(), [True, False, False, False])
++        self.assertEqual(env._smoothness_free_steps.tolist(), [8, 0, 0, 0])
++        torch.testing.assert_close(env.last_reward_terms["z_acc_penalty"], torch.tensor([60.0, -25.0, -25.0, -25.0]))
++        torch.testing.assert_close(env.last_reward_terms["jerk_penalty"], torch.tensor([60.0, -6.25, -6.25, -6.25]))
++
++
+ if __name__ == "__main__":
+     unittest.main()

@@ -36,6 +36,10 @@ class TiltedFrameTests(unittest.TestCase):
         ):
             setattr(env, name, torch.zeros(4, dtype=torch.long))
         env._pulse_lockout_steps = 60
+        env._initial_gap = torch.full((4,), -1.0)
+        env._progress_potential = torch.zeros(4)
+        env.target_period = 0.02
+        env._gripper_pulse_steps = torch.zeros(4, dtype=torch.long)
         env._in_release = torch.ones(4, dtype=torch.bool)
         env._release_cuboid_rel_z = torch.full((4,), -0.01)
         env._post_pulse_hold_countdown = torch.full((4,), 3, dtype=torch.long)
@@ -46,6 +50,8 @@ class TiltedFrameTests(unittest.TestCase):
         env.target_z_vel = torch.tensor([0.0, 0.1, -0.1, 0.2])
         env.prev_target_z_vel = -env.target_z_vel
         env.target_z_acc = torch.tensor([0.0, 5.0, 8.0, 10.0])
+        if cls is TiltedEnv:
+            env._reset_smoothness_state(torch.arange(env.num_envs))
         # Success, transverse drop, timeout, and improving regrasp/hold penalty.
         ee_task = torch.tensor([[0.0, 0.0, 0.8]]).repeat(4, 1)
         vel_task = torch.tensor([[0.0, 0.0, 0.0], [0.0, 0.0, 0.1], [0.0, 0.0, -0.1], [0.0, 0.0, 0.2]])
@@ -83,6 +89,9 @@ class TiltedFrameTests(unittest.TestCase):
         for angle in (0.0, 15.0, 30.0, 45.0):
             with self.subTest(angle=angle):
                 original, tilted = self.make_env(OriginalEnv), self.make_env(TiltedEnv, angle)
+                # Compare frame behavior with matching settings where defaults differ.
+                original.SUCCESS_REWARD = tilted.SUCCESS_REWARD
+                original.VEL_SIGN_FLIP_PENALTY_PER_MPS = tilted.VEL_SIGN_FLIP_PENALTY_PER_MPS
                 original._update_obs_buf()
                 tilted._update_obs_buf()
                 torch.testing.assert_close(tilted.obs_buf, original.obs_buf)
@@ -92,11 +101,11 @@ class TiltedFrameTests(unittest.TestCase):
                 expected_done, _, expected_timeout = original._compute_done_and_reward()
                 torch.testing.assert_close(actual_done, expected_done)
                 torch.testing.assert_close(actual_timeout, expected_timeout)
-                # Terms both envs still publish must agree: same formula, rotated frame.
+                # Unchanged terms must agree; regrasp and smoothness now use different formulas.
                 shared = tilted.last_reward_terms.keys() & original.last_reward_terms.keys()
                 self.assertIn("regrasp_bonus", shared)
                 self.assertIn("z_acc_penalty", shared)
-                for name in shared:
+                for name in shared - {"regrasp_bonus", "z_acc_penalty", "jerk_penalty"}:
                     torch.testing.assert_close(
                         tilted.last_reward_terms[name],
                         original.last_reward_terms[name],
@@ -139,50 +148,136 @@ class TiltedFrameTests(unittest.TestCase):
         torch.testing.assert_close(commands[1][:, 5], torch.full((4,), -0.4))
         torch.testing.assert_close(env.target_quat[:, 0], torch.ones(4))
 
-    def test_proximity_reward_is_bounded_positive_and_progressive(self):
-        env = self.make_env(TiltedEnv)
-        env.desired_rel_z = torch.zeros(4)
-        gaps = torch.tensor([0.0, 0.005, 0.02, TiltedEnv.PROXIMITY_REWARD_RANGE])
+    def _progress_stepper(self, env):
+        """Drive the env's reward at a chosen grasp-axis gap and read the payout back."""
+        env.desired_rel_z.zero_()
+        midpoint = (env.left_finger.pos + env.right_finger.pos) / 2
+        gap = torch.zeros(4)
+        zeros = torch.zeros(4)
+        env.cuboid = SimpleNamespace(get_pos=lambda: midpoint + torch.stack([zeros, zeros, gap], dim=-1))
 
-        def reward_for(gap):
-            env.desired_rel_z = torch.zeros(4)
-            env.cuboid = SimpleNamespace(get_pos=lambda: env.ee_link.get_pos())
-            k = TiltedEnv.PROXIMITY_REWARD_SHARPNESS
-            floor = math.exp(-k)
-            decay = torch.exp(-k * gap.abs() / TiltedEnv.PROXIMITY_REWARD_RANGE)
-            r = TiltedEnv.PROXIMITY_REWARD_MAX * (decay - floor) / (1.0 - floor)
-            return r.clamp(0.0, TiltedEnv.PROXIMITY_REWARD_MAX)
+        def step(values):
+            gap.copy_(torch.as_tensor(values, dtype=torch.float32))
+            env._compute_done_and_reward()
+            return env.last_reward_terms["progress_reward"].clone()
 
-        values = reward_for(gaps)
-        # Exact endpoints: max at zero gap, exactly zero at the range limit.
-        self.assertAlmostEqual(float(values[0]), TiltedEnv.PROXIMITY_REWARD_MAX, places=4)
-        self.assertAlmostEqual(float(values[-1]), 0.0, places=4)
-        # Strictly decreasing, never negative, never above the cap.
-        self.assertTrue(torch.all(values[1:] < values[:-1]))
-        self.assertTrue(torch.all(values >= 0.0))
-        self.assertTrue(torch.all(values <= TiltedEnv.PROXIMITY_REWARD_MAX))
-        # Beyond the range the clamp holds it at zero rather than going negative.
-        beyond = reward_for(torch.tensor([0.06, 0.1, 0.5, 1.0]))
-        torch.testing.assert_close(beyond, torch.zeros(4))
-        # Exponential, not linear: a convex decay sits below the straight line from
-        # MAX at d=0 to 0 at d=RANGE, so real reward is only earned close in.
-        probes = torch.tensor([0.0125, 0.025, 0.0375])
-        linear = TiltedEnv.PROXIMITY_REWARD_MAX * (1.0 - probes / TiltedEnv.PROXIMITY_REWARD_RANGE)
-        self.assertTrue(torch.all(reward_for(probes) < linear))
-        # Halving the gap must more than double the reward near the target.
-        close, twice = reward_for(torch.tensor([0.005, 0.01]))
-        self.assertGreater(float(close), float(twice))
+        return step
+
+    def test_progress_reward_shares_the_budget_by_fraction_of_initial_error(self):
+        env = self.make_env(TiltedEnv, angle=0.0)
+        step = self._progress_stepper(env)
+        budget = TiltedEnv.PROGRESS_REWARD_BUDGET
+        # Deliberately different initial errors: the total must not depend on the draw.
+        initial = torch.tensor([0.0125, 0.0175, 0.02, 0.0225])
+
+        # The first step of an episode only captures the denominator; it pays nothing.
+        torch.testing.assert_close(step(initial), torch.zeros(4))
+        torch.testing.assert_close(env._initial_gap, initial)
+        # Half the error closed is half the budget, for every initial error.
+        torch.testing.assert_close(step(initial / 2), torch.full((4,), budget / 2))
+        torch.testing.assert_close(env.last_reward_terms["progress_frac"], torch.full((4,), 0.5))
+        # Closing the rest pays the remainder, so reaching zero error pays exactly the
+        # budget in total -- and every bit of it arrived on a step, not at termination.
+        torch.testing.assert_close(step(torch.zeros(4)), torch.full((4,), budget / 2))
+        torch.testing.assert_close(env.last_reward_terms["progress_frac"], torch.ones(4))
+        # Sitting on the target pays nothing further: loitering cannot be farmed.
+        torch.testing.assert_close(step(torch.zeros(4)), torch.zeros(4))
+        torch.testing.assert_close(step(torch.zeros(4)), torch.zeros(4))
+
+    def test_progress_reward_charges_backsliding_and_totals_path_independently(self):
+        env = self.make_env(TiltedEnv, angle=0.0)
+        step = self._progress_stepper(env)
+        budget = TiltedEnv.PROGRESS_REWARD_BUDGET
+        initial = torch.tensor([0.0125, 0.0175, 0.02, 0.0225])
+
+        step(initial)
+        total = torch.zeros(4)
+        # Losing half the initial gap again costs exactly what closing it would pay.
+        total += step(initial * 1.5)
+        torch.testing.assert_close(total, torch.full((4,), -budget / 2))
+        # Returning to the start refunds it, so an in-and-out cycle nets zero.
+        total += step(initial)
+        torch.testing.assert_close(total, torch.zeros(4))
+        # The floor bounds the debt at one budget, reached at twice the initial gap.
+        total += step(initial * 2.0)
+        torch.testing.assert_close(total, torch.full((4,), -budget))
+        # Beyond the floor the term goes flat rather than unbounded.
+        torch.testing.assert_close(step(initial * 5.0), torch.zeros(4))
+        torch.testing.assert_close(step(initial * 20.0), torch.zeros(4))
+        # Whatever the detour, arriving at zero error leaves the episode total at the
+        # budget: the payouts telescope to PHI(end) - PHI(start).
+        total += step(torch.zeros(4))
+        torch.testing.assert_close(total, torch.full((4,), budget))
+
+    def test_progress_reward_resets_its_denominator_per_episode(self):
+        env = self.make_env(TiltedEnv, angle=0.0)
+        step = self._progress_stepper(env)
+        budget = TiltedEnv.PROGRESS_REWARD_BUDGET
+
+        step(torch.full((4,), 0.02))
+        step(torch.full((4,), 0.01))
+        # A reset re-arms the sentinel, so the next episode measures its own gap and
+        # does not pay out the jump from the previous episode's final position.
+        env._initial_gap.fill_(-1.0)
+        env._progress_potential.zero_()
+        torch.testing.assert_close(step(torch.full((4,), 0.005)), torch.zeros(4))
+        torch.testing.assert_close(env._initial_gap, torch.full((4,), 0.005))
+        # The new, smaller error is still worth the full budget to close.
+        torch.testing.assert_close(step(torch.zeros(4)), torch.full((4,), budget))
+
+    def test_progress_reward_guards_a_degenerate_initial_gap(self):
+        env = self.make_env(TiltedEnv, angle=0.0)
+        step = self._progress_stepper(env)
+        # An env that resets already on target cannot divide by zero, and must not be
+        # handed free reward for a gap it never had to close.
+        torch.testing.assert_close(step(torch.zeros(4)), torch.zeros(4))
+        torch.testing.assert_close(env._initial_gap, torch.full((4,), TiltedEnv.PROGRESS_MIN_INITIAL_GAP))
+        torch.testing.assert_close(step(torch.zeros(4)), torch.zeros(4))
 
     def test_reward_sums_only_the_weighted_terms(self):
         env = self.make_env(TiltedEnv)
         _, reward, _ = env._compute_done_and_reward()
         weights = TiltedEnv.REWARD_TERM_WEIGHTS
-        self.assertEqual(set(weights), {"base_reward", "proximity_reward", "regrasp_bonus", "z_acc_penalty"})
+        self.assertEqual(
+            set(weights),
+            {
+                "base_reward",
+                "progress_reward",
+                "regrasp_bonus",
+                "z_acc_penalty",
+                "jerk_penalty",
+                "vel_sign_flip_penalty",
+                "blockade_motion_penalty",
+                "speed_penalty",
+            },
+        )
         expected = sum(weights[k] * env.last_reward_terms[k] for k in weights)
         torch.testing.assert_close(reward, expected)
         # Dropped terms must not linger in the table, or its total would double-count.
-        for gone in ("jerk_penalty", "vel_sign_flip_penalty", "post_pulse_hold_penalty"):
-            self.assertNotIn(gone, env.last_reward_terms)
+        self.assertNotIn("post_pulse_hold_penalty", env.last_reward_terms)
+
+    def test_regrasp_scale_cap_and_event_eligibility(self):
+        env = self.make_env(TiltedEnv, angle=0.0)
+        env.desired_rel_z.zero_()
+        midpoint = (env.left_finger.pos + env.right_finger.pos) / 2
+        env.cuboid.get_pos = lambda: midpoint
+        env._release_cuboid_rel_z = torch.tensor([0.01, 0.03, 0.03, 0.03])
+        env._in_release[2] = False  # no release -> regrasp event
+        env._regrasp_count[3] = env.REGRASP_BONUS_MAX_COUNT
+        env._compute_done_and_reward()
+        # 10 mm improvement uses the new 7500 coefficient; 30 mm hits the raw cap.
+        torch.testing.assert_close(env.last_reward_terms["regrasp_bonus"], torch.tensor([177.77778, 10000.0, 0.0, 0.0]))
+
+    def test_regrasp_worsening_keeps_negative_multiplier(self):
+        env = self.make_env(TiltedEnv, angle=0.0)
+        env.desired_rel_z.zero_()
+        env._release_cuboid_rel_z.zero_()
+        midpoint = (env.left_finger.pos + env.right_finger.pos) / 2
+        env.cuboid.get_pos = lambda: midpoint + torch.tensor([0.0, 0.0, 0.01])
+        env._compute_done_and_reward()
+        torch.testing.assert_close(
+            env.last_reward_terms["regrasp_bonus"], torch.full((4,), -888.88889), rtol=1e-4, atol=0.001
+        )
 
     def test_joint_angle_produces_requested_inclination(self):
         # The home joint-5 axis is not horizontal, so simply setting q5=-tilt
@@ -215,6 +310,110 @@ class TiltedFrameTests(unittest.TestCase):
         torch.testing.assert_close(env.task_axes[1].T @ env.task_axes[1], torch.eye(3))
         torch.testing.assert_close(torch.linalg.det(env.task_axes[1]), torch.tensor(1.0))
         torch.testing.assert_close(env.task_axes[1], torch.eye(3))
+
+
+class PulseSmoothnessTests(unittest.TestCase):
+    def make_env(self):
+        env = TiltedEnv.__new__(TiltedEnv)
+        env.num_envs = 2
+        env.device = torch.device("cpu")
+        env.target_z_acc = torch.zeros(2)
+        env._reset_smoothness_state(torch.arange(2))
+        return env
+
+    def advance(self, env, acceleration, fired=(False, False)):
+        env.prev_target_z_acc = env.target_z_acc.clone()
+        env.target_z_acc = torch.tensor(acceleration, dtype=torch.float32)
+        env._pulse_fired = torch.tensor(fired)
+        return torch.stack(env._compute_smoothness_penalties(), dim=-1)
+
+    def test_thirty_step_worst_case_and_constant_acceleration(self):
+        env = self.make_env()
+        total = torch.zeros(2)
+        for step in range(30):
+            terms = self.advance(env, [15.0 * (-1) ** step, 15.0])
+            total += terms.sum(dim=-1)
+            if step > 0:
+                self.assertEqual(terms[0].sum().item(), -50.0)
+                self.assertEqual(terms[1, 1].item(), 0.0)
+        # First acceleration change is 0 -> 15, not -15 -> 15: 18.75 below the bound.
+        torch.testing.assert_close(total, torch.tensor([-1481.25, -756.25]))
+        env = self.make_env()
+        env.target_z_acc.fill_(-15.0)
+        total = 0.0
+        for step in range(30):
+            total += self.advance(env, [15.0 * (-1) ** step, 0.0])[0].sum().item()
+        self.assertEqual(total, -1500.0)
+
+    def test_refund_last_six_steps_and_exact_exemption_boundary(self):
+        env = self.make_env()
+        history = []
+        for step in range(10):
+            value = (6.0 + step) * (-1) ** step
+            history.append(self.advance(env, [value, value]))
+        refund = self.advance(env, [15.0, 15.0], fired=(True, False))
+        torch.testing.assert_close(refund[0], -torch.stack(history[-6:])[:, 0].sum(dim=0))
+        self.assertEqual(refund[1].sum().item(), -50.0)
+        for step in range(8):
+            value = -15.0 * (-1) ** step
+            terms = self.advance(env, [value, value])
+            torch.testing.assert_close(terms[0], torch.zeros(2))
+            self.assertEqual(terms[1].sum().item(), -50.0)
+        terms = self.advance(env, [-15.0, -15.0])
+        torch.testing.assert_close(terms, torch.full((2, 2), -25.0))
+
+    def test_refunded_and_exempt_steps_cannot_be_refunded_again(self):
+        env = self.make_env()
+        self.advance(env, [15.0, 15.0])
+        first = self.advance(env, [-15.0, -15.0], fired=(True, False))
+        torch.testing.assert_close(first[0], torch.tensor([25.0, 6.25]))
+        second = self.advance(env, [15.0, 15.0], fired=(True, False))
+        torch.testing.assert_close(second[0], torch.zeros(2))
+
+    def test_partial_reset_clears_history_exemption_and_previous_acceleration(self):
+        env = self.make_env()
+        self.advance(env, [15.0, 15.0])
+        self.advance(env, [-15.0, -15.0], fired=(True, False))
+        history = env._smoothness_history[1].clone()
+        env._reset_smoothness_state(torch.tensor([0]))
+        self.assertEqual(env.prev_target_z_acc[0].item(), 0.0)
+        self.assertFalse(env._pulse_fired[0].item())
+        self.assertEqual(env._smoothness_free_steps[0].item(), 0)
+        torch.testing.assert_close(env._smoothness_history[0], torch.zeros_like(history))
+        torch.testing.assert_close(env._smoothness_history[1], history)
+        self.assertEqual(env.prev_target_z_acc[1].item(), 15.0)
+
+    def test_only_accepted_trigger_refunds_in_actual_step(self):
+        env = TiltedFrameTests().make_env(TiltedEnv)
+        env.target_z = torch.full((4,), env.HOME_TASK_Z)
+        env.target_z_vel.zero_()
+        env.target_z_acc.zero_()
+        env.gripper_pos_min = torch.full((2,), env.GRIPPER_CLOSED)
+        env.gripper_pos_max = torch.full((2,), env.GRIPPER_OPEN)
+        env._prev_gripper_avg = torch.full((4,), env.GRIPPER_CLOSED)
+        env._gripper_pulse_delays = torch.full((4,), env.PULSE_DELAY_STEPS)
+        env._gripper_pulse_lengths = torch.full((4,), env.PULSE_LENGTH)
+        env._post_pulse_delay_total = env._post_pulse_hold_total = 25
+        # Accepted, blocked by lockout, blocked at episode start, already active.
+        env._steps_since_pulse = torch.tensor([61, 0, 61, 61])
+        env.episode_length_buf = torch.tensor([50, 50, 49, 50])
+        env._gripper_pulse_steps = torch.tensor([0, 0, 0, 2])
+        env._smoothness_history.fill_(-10.0)
+        env.sim_step = 0
+        env.dt = 0.001
+        env.target_update_every = 0  # exercise real step/reward logic without physics
+        env.num_actions = 3
+        env.fingers_dof = torch.tensor([7, 8])
+        env.franka.control_dofs_position = lambda *args, **kwargs: None
+        env._reset_idx = lambda indices: None
+        env._update_obs_buf = lambda: None
+        env.get_observations = lambda: None
+        env.extras = {}
+        env.step(torch.ones(4, 3))
+        self.assertEqual(env._pulse_fired.tolist(), [True, False, False, False])
+        self.assertEqual(env._smoothness_free_steps.tolist(), [8, 0, 0, 0])
+        torch.testing.assert_close(env.last_reward_terms["z_acc_penalty"], torch.tensor([60.0, -25.0, -25.0, -25.0]))
+        torch.testing.assert_close(env.last_reward_terms["jerk_penalty"], torch.tensor([60.0, -6.25, -6.25, -6.25]))
 
 
 if __name__ == "__main__":

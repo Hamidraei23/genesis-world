@@ -48,12 +48,16 @@ except (metadata.PackageNotFoundError, ImportError, ValueError) as e:
 from rsl_rl.runners import OnPolicyRunner
 
 import genesis as gs
+from genesis.vis.keybindings import Key, KeyAction, Keybind
 
 # Env modules live next to this script; make them importable however it is launched
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from train_franka_ppo import build_env, load_env_class, resolve_tilt_kwargs
 
 DEFAULT_ENV = "env_franka_parallel"
+# --interactive: arrow up / down pushes the cuboid along the grasp axis
+PUSH_FORCE = 5.0  # N
+PUSH_DURATION = 0.01  # s
 ENV_2H = "env_franka_parallel_backup_2h"
 
 
@@ -131,6 +135,13 @@ def main():
                         help="Fixed grasp-axis tilt (0-45). Defaults to the training angle, or 30 for the tilted env.")
     parser.add_argument("--2H", dest="use_2h", action="store_true", default=False,
                         help="Use env_franka_parallel_backup_2h and logs/<exp_name>-2H-control")
+    parser.add_argument("--sliding", type=float, default=None,
+                        help="Fix the finger-cuboid sliding friction to this value every episode, "
+                             "replacing the per-episode [FRICTION_MIN, FRICTION_MAX] draw")
+    parser.add_argument("--interactive", action="store_true", default=False,
+                        help="Only the geometric fails end an episode (not success, timeout or the regrasp "
+                             f"limit); arrow up / down in the viewer pushes the cuboid {PUSH_FORCE:g} N "
+                             f"along the grasp axis for {PUSH_DURATION * 1000:g} ms")
     args = parser.parse_args()
 
     if args.record:
@@ -139,6 +150,8 @@ def main():
         raise ValueError("--replay-speed must be greater than 0")
     if args.render_every <= 0:
         raise ValueError("--render-every must be greater than 0")
+    if args.sliding is not None and args.sliding <= 0.0:
+        raise ValueError("--sliding must be greater than 0")
 
     log_dir = f"logs/{args.exp_name}"
     if args.use_2h:
@@ -194,6 +207,34 @@ def main():
         control_error=args.control_error,
         **tilt_kwargs,
     ))
+
+    # Contacts take the larger of the two geoms' friction, which is FRICTION_BASE (the cuboid)
+    # times the per-env ratio. Collapsing the sampling range pins that ratio to sliding / BASE,
+    # applied on every reset from here on.
+    if args.sliding is not None:
+        if not hasattr(env, "FRICTION_BASE"):
+            raise ValueError(f"--sliding: {env_cls.__name__} has no friction randomisation to override")
+        env.FRICTION_MIN = env.FRICTION_RANDOM_MIN = env.FRICTION_MAX = args.sliding
+        print(f"Sliding friction fixed at {args.sliding:g} "
+              f"(ratio {args.sliding / env.FRICTION_BASE:.3f} x base {env.FRICTION_BASE:g})")
+
+    # Key callbacks only queue the push; the run loop hands it to the env between steps.
+    pending_pushes: list[float] = []
+    if args.interactive:
+        if not hasattr(env, "push_cuboid"):
+            raise ValueError(f"--interactive: {env_cls.__name__} does not support interactive mode")
+        env.interactive = True
+        if args.vis:
+            env.scene.viewer.register_keybinds(
+                Keybind("push_cuboid_up", Key.UP, KeyAction.PRESS,
+                        callback=pending_pushes.append, args=(PUSH_FORCE,)),
+                Keybind("push_cuboid_down", Key.DOWN, KeyAction.PRESS,
+                        callback=pending_pushes.append, args=(-PUSH_FORCE,)),
+            )
+            print(f"Interactive: arrow up / down pushes the cuboid {PUSH_FORCE:g} N along the grasp axis "
+                  f"for {PUSH_DURATION * 1000:g} ms")
+        else:
+            print("Interactive: no viewer, so the arrow-key pushes are unavailable")
 
     # ---- load policy ------------------------------------------------------
     runner = OnPolicyRunner(env, train_cfg, log_dir, device=gs.device)
@@ -654,6 +695,7 @@ def main():
     post_pulse_hold_remaining = 0
     wait_for_post_pulse_direction_change = False
     prev_policy_z_vel_sign = 0
+    success_reached = False  # --interactive: announce the first success of each episode once
 
     print(
         f"target_dt={env.target_period:.3f}s  sim_dt={env.dt:.3f}s  "
@@ -713,8 +755,16 @@ def main():
                         post_pulse_hold_remaining -= 1
 
                     pulse_steps_before = env._gripper_pulse_steps[0].item()
+                while pending_pushes:
+                    push = pending_pushes.pop(0)
+                    env.push_cuboid(push, PUSH_DURATION)
+                    print(f"  push {push:+g} N along the grasp axis for {PUSH_DURATION * 1000:g} ms")
                 pulse_state = _pulse_state(env)   # pre-step, matching the gate step() evaluates
                 obs_td, rew_buf, reset_buf, _ = env.step(actions, update_visualizer=not args.vis)
+                if args.interactive and not success_reached and \
+                        _reward_term_float(env.last_reward_terms.get("ep_success"), 0.0) > 0.5:
+                    success_reached = True
+                    print(f"  SUCCESS condition met at step {ep_len + 1} (interactive: episode continues)")
                 if policy_is_recurrent:
                     policy.reset(reset_buf)
 
@@ -797,6 +847,7 @@ def main():
                     post_pulse_hold_remaining = 0
                     wait_for_post_pulse_direction_change = False
                     prev_policy_z_vel_sign = 0
+                    success_reached = False
 
                 elif args.zero and pulse_steps_before == 1:
                     wait_for_post_pulse_direction_change = True

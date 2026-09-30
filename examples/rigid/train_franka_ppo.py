@@ -5,6 +5,13 @@ Usage (from workspace root):
     python examples/rigid/train_franka_ppo.py
     python examples/rigid/train_franka_ppo.py -B 512 --max_iterations 1000
     python examples/rigid/train_franka_ppo.py --resume logs/franka-lift/model_100.pt
+    python examples/rigid/train_franka_ppo.py --warm-start logs/franka-lift/model_100.pt
+
+--resume continues a run: actor, critic, optimizer and iteration counter all come
+back. --warm-start takes only the actor, starts the critic and optimizer clean and
+fits the critic to the frozen policy for --warmup-iters iterations before the actor
+is allowed to move -- use it after changing the reward, where the saved critic
+predicts values on a return scale that no longer exists.
 
 Any environment module can be selected with --env (default: env_franka_parallel):
     python examples/rigid/train_franka_ppo.py --env env_franka_parallel_june
@@ -44,6 +51,7 @@ from reward_table import RewardTermTracker
 
 
 DEFAULT_ENV = "env_franka_parallel"
+DEFAULT_WARMUP_ITERS = 50
 
 
 # ---------------------------------------------------------------------------
@@ -201,7 +209,19 @@ def build_parser(description: str = "PPO training for FrankaEnvParallel") -> arg
                         help="Total PPO update iterations")
     parser.add_argument("--seed", type=int, default=1)
     parser.add_argument("--resume", type=str, default=None,
-                        help="Path to a checkpoint .pt file to resume training from")
+                        help="Path to a checkpoint .pt file to resume training from "
+                             "(actor, critic, optimizer and iteration counter)")
+    parser.add_argument("--warm-start", type=str, default=None, metavar="CKPT",
+                        help="Start from a checkpoint's ACTOR weights only: the critic and the optimizer start "
+                             "fresh and the critic is trained alone for --warmup-iters iterations before the "
+                             "actor is unfrozen. Mutually exclusive with --resume")
+    parser.add_argument("--warmup-iters", type=int, default=None, metavar="N",
+                        help=f"Critic-only iterations run before the actor is unfrozen "
+                             f"(default: {DEFAULT_WARMUP_ITERS}). They are extra: the run ends after "
+                             f"warm-up + --max_iterations iterations. Requires --warm-start")
+    parser.add_argument("--warm-start-critic", action="store_true",
+                        help="Warm the checkpoint's critic instead of a freshly initialised one. Requires "
+                             "--warm-start")
     parser.add_argument("--dt", type=float, default=0.001,
                         help="Physics sim timestep (seconds)")
     parser.add_argument("--target_dt", type=float, default=0.02,
@@ -232,12 +252,90 @@ def build_parser(description: str = "PPO training for FrankaEnvParallel") -> arg
 
 def validate_args(parser: argparse.ArgumentParser, args) -> None:
     """Reject flag combinations that cannot be honoured."""
+    if args.warm_start is not None:
+        if args.resume is not None:
+            parser.error("--warm-start and --resume are mutually exclusive: --resume restores the critic and "
+                         "the optimizer as well, which is what --warm-start deliberately does not do")
+        if not os.path.isfile(args.warm_start):
+            parser.error(f"--warm-start checkpoint not found: {args.warm_start}")
+        if args.warmup_iters is not None and args.warmup_iters < 1:
+            parser.error("--warmup-iters must be at least 1")
+    else:
+        if args.warmup_iters is not None:
+            parser.error("--warmup-iters requires --warm-start")
+        if args.warm_start_critic:
+            parser.error("--warm-start-critic requires --warm-start")
+
     if args.randomize_at is not None:
         if args.randomize:
             parser.error("--randomize-at and --randomize are mutually exclusive: "
                          "--randomize-at already turns randomization on mid-run")
         if not 0 < args.randomize_at < args.max_iterations:
             parser.error(f"--randomize-at must be in (0, --max_iterations={args.max_iterations})")
+
+
+def reset_optimizer(runner, train_cfg: dict) -> None:
+    """Rebuild the optimizer from scratch at the configured learning rate."""
+    alg = runner.alg
+    lr = train_cfg["algorithm"]["learning_rate"]
+    # alg.learning_rate is what the adaptive KL schedule reads and rewrites; keeping
+    # it in step with the fresh param_groups stops a stale rate from coming back.
+    alg.learning_rate = lr
+    alg.optimizer = type(alg.optimizer)(
+        list(alg.actor.parameters()) + list(alg.critic.parameters()), lr=lr
+    )
+
+
+def warm_start(runner, args, train_cfg: dict) -> None:
+    """Load only the actor, then fit the critic to it before any actor update.
+
+    A saved critic predicts values on the return scale of the reward that trained
+    it. Reuse it after a reward change and the first advantages are wrong by a
+    constant-ish offset, which is enough to wreck a good actor in a handful of
+    updates. So: take the actor, start the critic and the optimizer clean, freeze
+    every actor parameter -- the mean network and the exploration std alike, so
+    rollouts keep sampling from exactly the loaded policy -- and run ordinary PPO
+    iterations in which only the critic can move. Then release the actor.
+    """
+    iters = DEFAULT_WARMUP_ITERS if args.warmup_iters is None else args.warmup_iters
+
+    runner.load(
+        args.warm_start,
+        load_cfg={
+            "actor": True,
+            "critic": args.warm_start_critic,
+            "optimizer": False,
+            "iteration": False,
+        },
+    )
+    source = "actor + critic" if args.warm_start_critic else "actor only"
+    print(f"Warm start ({source}) from checkpoint: {args.warm_start}")
+    reset_optimizer(runner, train_cfg)
+
+    frozen = 0
+    for p in runner.alg.actor.parameters():
+        p.requires_grad_(False)
+        frozen += p.numel()
+
+    # With the actor frozen the measured KL is ~0 at every update, and the adaptive
+    # schedule reads that as "step harder" and ratchets the learning rate up until
+    # the critic diverges. Pin the rate for the warm-up, restore the schedule after.
+    schedule = runner.alg.schedule
+    runner.alg.schedule = "fixed"
+
+    print(f"\n=== Critic warm-up: {iters} iterations, {frozen} actor parameters frozen ===")
+    print("Mean value loss should fall and plateau; mean reward should stay flat.\n")
+    runner.learn(num_learning_iterations=iters, init_at_random_ep_len=True)
+
+    for p in runner.alg.actor.parameters():
+        p.requires_grad_(True)
+    runner.alg.schedule = schedule
+    # The warm-up only ever stepped critic parameters, so its Adam moments describe
+    # half the problem; the joint phase starts clean like any fresh run.
+    reset_optimizer(runner, train_cfg)
+    # Step past the last warm-up iteration so training does not repeat it
+    runner.current_learning_iteration += 1
+    print(f"\n=== Actor unfrozen at iteration {runner.current_learning_iteration} ===\n")
 
 
 def run_training(args, train_cfg: dict) -> None:
@@ -248,6 +346,14 @@ def run_training(args, train_cfg: dict) -> None:
     print(f"Environment: {env_cls.__module__}.{env_cls.__name__}")
 
     log_dir = f"logs/{args.exp_name}"
+
+    # A warm start is a fresh run, so the wipe below would delete the very
+    # checkpoint it is about to load if the two share an experiment name.
+    if args.warm_start is not None and Path(args.warm_start).resolve().is_relative_to(Path(log_dir).resolve()):
+        raise ValueError(
+            f"--warm-start checkpoint lives inside logs/{args.exp_name}, which this run wipes on start; "
+            f"pick a different -e/--exp_name"
+        )
 
     # Fresh run: wipe old logs; resume: keep them
     if args.resume is None:
@@ -310,9 +416,14 @@ def run_training(args, train_cfg: dict) -> None:
     if args.resume is not None:
         runner.load(args.resume)
         print(f"Resumed from checkpoint: {args.resume}")
+    elif args.warm_start is not None:
+        warm_start(runner, args, train_cfg)
+
+    # The warm-up already staggered the episodes and left them running mid-flight
+    init_at_random_ep_len = args.warm_start is None
 
     if args.randomize_at is None:
-        runner.learn(num_learning_iterations=args.max_iterations, init_at_random_ep_len=True)
+        runner.learn(num_learning_iterations=args.max_iterations, init_at_random_ep_len=init_at_random_ep_len)
     else:
         if not hasattr(env, "randomize"):
             raise RuntimeError(
@@ -321,7 +432,7 @@ def run_training(args, train_cfg: dict) -> None:
             )
 
         # Phase 1: randomization off
-        runner.learn(num_learning_iterations=args.randomize_at, init_at_random_ep_len=True)
+        runner.learn(num_learning_iterations=args.randomize_at, init_at_random_ep_len=init_at_random_ep_len)
 
         # Flip randomization on in place. Every env read of self.randomize happens at
         # runtime (obs noise per step; pulse/gain/velocity sampling per episode reset),

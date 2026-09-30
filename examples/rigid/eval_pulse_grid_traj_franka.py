@@ -90,7 +90,7 @@ from eval_test_franka_delays import (  # noqa: E402
     reseed,
     set_pulse,
 )
-from train_franka_ppo import build_env  # noqa: E402
+from train_franka_ppo import build_env, resolve_tilt_kwargs  # noqa: E402
 
 
 # Columns read off the env state each step (order matters: written as-is)
@@ -216,6 +216,8 @@ def run_combo(env, policy, pins: EnvPins, delay: int, length: int,
         env.cam.start_recording()
 
     obs = env.reset()
+    if getattr(policy, "is_recurrent", False):
+        policy.reset()
     used = observed_pulse(env)
     if used["delays"] != [delay] or used["lengths"] != [length]:
         raise RuntimeError(
@@ -236,6 +238,10 @@ def run_combo(env, policy, pins: EnvPins, delay: int, length: int,
 
         act = actions.detach().float()
         obs, rew, done, _extras = env.step(actions)
+        # A recurrent policy (GRU/LSTM) must forget the episode the env just reset,
+        # or the next episode starts from stale memory.
+        if getattr(policy, "is_recurrent", False):
+            policy.reset(done)
         if args.record:
             env.cam.render()
 
@@ -345,6 +351,9 @@ def main():
     p.add_argument("--seed", type=int, default=1)
     p.add_argument("--progress-every", type=int, default=100,
                    help="Print a progress line every N policy steps (0 = silent)")
+    p.add_argument("--tilt-deg", type=float, default=None,
+                   help="Fixed grasp-axis tilt (0-45) for tilted envs. Defaults to the "
+                        "angle recorded in logs/<exp_name>/env_cfg.pkl at training time.")
     p.add_argument("--dt", type=float, default=0.001)
     p.add_argument("--target_dt", type=float, default=0.02)
     p.add_argument("--out-dir", type=str, default=None,
@@ -379,7 +388,16 @@ def main():
 
     env_spec = args.env or resolve_env_spec(log_dir, args.exp_name)
     env_cls = load_env_class(env_spec)
+    tilt_deg = args.tilt_deg
+    if tilt_deg is None and hasattr(env_cls, "DEFAULT_TILT_DEG"):
+        cfg_path = os.path.join(log_dir, "env_cfg.pkl")
+        if os.path.isfile(cfg_path):
+            with open(cfg_path, "rb") as f:
+                tilt_deg = pickle.load(f).get("tilt_deg")
+    tilt_kwargs = resolve_tilt_kwargs(env_cls, tilt_deg)
     print(f"### {args.exp_name}: env={env_spec} -> {env_cls.__name__}")
+    if tilt_kwargs:
+        print(f"Grasp-axis tilt: {tilt_kwargs['tilt_deg']:g} degrees from vertical")
 
     if args.ckpt is not None:
         ckpt_iter = args.ckpt
@@ -414,6 +432,7 @@ def main():
         randomize=args.randomize,
         zero=args.zero,
         control_error=args.control_error,
+        **tilt_kwargs,
     ))
     pins = EnvPins(env, args.desired_rel_z)
     GripperCommandCapture(env)
@@ -447,6 +466,7 @@ def main():
         "ckpt_path": ckpt_path,
         "desired_rel_z": args.desired_rel_z,
         "solid_up": False,
+        "tilt_deg": tilt_kwargs.get("tilt_deg"),
         "num_envs": args.num_envs,
         "seed": args.seed,
         "target_dt": args.target_dt,

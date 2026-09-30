@@ -1,4 +1,9 @@
-"""Franka regrasp with a configurable fixed grasp-axis tilt from 0 to 45 degrees.
+"""Franka regrasp with a configurable fixed grasp-axis tilt from 0 to 45 degrees,
+without finger contact forces in the observation.
+
+Copy of env_franka_parallel_tilted with left_force_mag and right_force_mag removed
+from the observation (8 channels instead of 10). Rewards, success and failure still
+read the finger contact forces internally; only the policy no longer sees them.
 
 ``tilt_deg`` is inclination from world vertical, toward the pictured joint-5
 homing direction (approximately world +Y), not an absolute Euler pitch angle.
@@ -8,15 +13,14 @@ original joint home, object alignment, and world-coordinate task axes.
 All Z names refer to the fixed tilted grasp axis. Position coordinates are
 HOME_TASK_Z plus displacement along that axis from home. Observations, reward
 formulas, success/failure distances and hold targets use this same frame.
-The observation layout remains compatible with existing policies; the tilt is
-fixed for the run and is not an additional observation. Gravity stays world-down.
+The tilt is fixed for the run and is not an additional observation. Gravity stays world-down.
 Transverse and orientation feedback hold the line and home quaternion; axial
 position gain, action filter, reward weights and action scales are retained.
 
 Train:
-    python examples/rigid/train_franka_ppo.py --env env_franka_parallel_tilted --tilt-deg 20 -e franka-tilted20
+    python examples/rigid/train_franka_ppo.py --env env_franka_parallel_tilted_no_force --tilt-deg 20 -e franka-tilted20-no-force
 Preview:
-    python examples/rigid/env_franka_parallel_tilted.py -B 1 --vis --tilt-deg 45
+    python examples/rigid/env_franka_parallel_tilted_no_force.py -B 1 --vis --tilt-deg 45
 """
 
 import math
@@ -75,7 +79,7 @@ def _tc_quat_mul(u: torch.Tensor, v: torch.Tensor) -> torch.Tensor:
 # ---------------------------------------------------------------------------
 
 
-class FrankaEnvParallelTilted:
+class FrankaEnvParallelTiltedNoForce:
     """
     Vectorised tilted Franka environment.
 
@@ -83,22 +87,20 @@ class FrankaEnvParallelTilted:
     EE positions use HOME_TASK_Z + displacement from home along that axis.
     Cuboid relative X/Y/Z and EE velocities are projected into that same frame.
 
-    Observations: flat tensor (N, OBS_DIM=10)
+    Observations: flat tensor (N, OBS_DIM=8)
         [0]    ee_pos_z
         [1]    ee_vel_z
         [2]    target_z_vel
         [3]    target_z_acc
-        [4]    left_force_mag   (scalar)
-        [5]    right_force_mag  (scalar)
-        [6]    cuboid_rel_z
-        [7]    cuboid_rel_x
-        [8]    cuboid_rel_y
-        [9]    desired_rel_z
+        [4]    cuboid_rel_z
+        [5]    cuboid_rel_x
+        [6]    cuboid_rel_y
+        [7]    desired_rel_z
 
         Future Observations (To be added):
-        [10]   last_pulse_gap_z_improve (LAST PULSE GAP z improvement)
-        [11]   pulse_gap_duration (Duration of gap derived from finger pos)
-        [12]   acc_drop_to_open_delay (Delay from the moment acceleration of EE goes below -10.0 to the moment end effector opens, in ms. Can be positive or negative)
+        [8]    last_pulse_gap_z_improve (LAST PULSE GAP z improvement)
+        [9]    pulse_gap_duration (Duration of gap derived from finger pos)
+        [10]   acc_drop_to_open_delay (Delay from the moment acceleration of EE goes below -10.0 to the moment end effector opens, in ms. Can be positive or negative)
 
     Actions (per env, shape (N, action_dim=3)):
         [0]   target_z_vel
@@ -111,28 +113,25 @@ class FrankaEnvParallelTilted:
     HOME_TASK_Z = 0.854586497
 
     # Observation layout constants
-    OBS_DIM = 10
+    OBS_DIM = 8
     OBS_EE_POS_Z = 0
     OBS_EE_VEL_Z = 1
     OBS_TARGET_Z_VEL = 2
     OBS_TARGET_Z_ACC = 3
-    OBS_LEFT_FORCE_MAG = 4
-    OBS_RIGHT_FORCE_MAG = 5
-    OBS_CUBOID_REL_Z = 6
-    OBS_CUBOID_REL_X = 7
-    OBS_CUBOID_REL_Y = 8
-    OBS_DESIRED_REL_Z = 9
+    OBS_CUBOID_REL_Z = 4
+    OBS_CUBOID_REL_X = 5
+    OBS_CUBOID_REL_Y = 6
+    OBS_DESIRED_REL_Z = 7
     # Future Observations (To be added):
-    # OBS_LAST_PULSE_GAP_Z_IMPROVE = 10
-    # OBS_PULSE_GAP_DURATION       = 11
-    # OBS_ACC_DROP_TO_OPEN_DELAY   = 12
+    # OBS_LAST_PULSE_GAP_Z_IMPROVE = 8
+    # OBS_PULSE_GAP_DURATION       = 9
+    # OBS_ACC_DROP_TO_OPEN_DELAY   = 10
 
     # Fixed observation normalization scales (divide raw obs by these)
     # Order: ee_pos_z, ee_vel_z, target_z_vel, target_z_acc,
-    #        left_force_mag, right_force_mag,
     #        cuboid_rel_z, cuboid_rel_x, cuboid_rel_y, desired_rel_z
     #        (Future: last_pulse_gap_z_improve, pulse_gap_duration, acc_drop_to_open_delay)
-    OBS_SCALE = [1.0, 0.6, 0.6, 15.0, 5.0, 5.0, 0.05, 0.05, 0.05, 0.05]
+    OBS_SCALE = [1.0, 0.6, 0.6, 15.0, 0.05, 0.05, 0.05, 0.05]
 
     # Weights applied to each additive reward component in _compute_done_and_reward.
     # Also read by reward_table.RewardTermTracker for the per-iteration table.
@@ -158,8 +157,8 @@ class FrankaEnvParallelTilted:
     Z_ACC_PENALTY_THRESHOLD = 0.0
     # At the default outer reward weights, saturated alternating acceleration costs
     # 25 + 25 = 50 per step, or 1500 over 30 unrefunded steps (1481.25 from rest).
-    Z_ACC_PENALTY_WEIGHT = 25.0
-    JERK_PENALTY_WEIGHT = 25.0  # squared acceleration change / (2 * Z_ACC_MAX)
+    Z_ACC_PENALTY_WEIGHT = 35.0
+    JERK_PENALTY_WEIGHT = 35.0  # squared acceleration change / (2 * Z_ACC_MAX)
     SMOOTHNESS_REFUND_STEPS = 6  # preceding charged steps refunded on an accepted pulse trigger
     SMOOTHNESS_FREE_STEPS_AFTER_PULSE = 8  # firing step is also free: 9 steps total
     EE_Z_TARGET = 0.7
@@ -185,18 +184,18 @@ class FrankaEnvParallelTilted:
     SUCCESS_REWARD = 10000.0  # +25 % over the previous 3000
     SUCCESS_TIME_PENALTY = 0.3  # per episode step, subtracted from SUCCESS_REWARD
     ALIVE_PENALTY = 1.25  # per non-terminal step
-    TIMEOUT_PENALTY = 250.0
-    FAIL_PENALTY_MARGIN = 100.0  # fail = TIMEOUT + ALIVE * max_episode_length + margin
+    TIMEOUT_PENALTY = 4000.0
+    # fail = TIMEOUT + ALIVE * max_episode_length + margin = 4000 + 562.5 + 437.5 = 5000
+    FAIL_PENALTY_MARGIN = 437.5
     SUCCESS_REQUIRED_STEPS = 5
     # Dense proximity reward on the grasp-axis gap to the commanded offset.
-    # r(d) = MAX * (exp(-K*d/RANGE) - exp(-K)) / (1 - exp(-K)), clamped to [0, MAX].
-    # Exponential in d, so it climbs steeply only near the target: MAX at d = 0,
-    # exactly 0 at d = RANGE, and clamped to 0 beyond it -- never negative.
-    # With the values below: 0 mm -> 20.0, 5 mm -> 12.1, 10 mm -> 7.3, 20 mm -> 2.6.
-    # Scaled so a full 450-step episode of loitering near the target returns roughly
-    # 475, well under SUCCESS_REWARD, leaving the terminal signal in charge.
+    # r(d) = MAX * (exp(-K*d/d0) - exp(-K)) / (1 - exp(-K)), clamped to [0, MAX],
+    # where d0 is the gap measured on the first step of the episode. Every episode
+    # therefore starts at 0 and reaches MAX at d = 0 whatever its commanded offset;
+    # drifting past the starting gap is clamped to 0 -- never negative.
+    # With K = 5: d/d0 = 1 -> 0.0, 0.5 -> 2.3, 0.25 -> 8.5, 0.1 -> 18.1, 0 -> 30.0.
     PROXIMITY_REWARD_MAX = 30.0
-    PROXIMITY_REWARD_RANGE = 0.05  # m: gap at which the reward reaches zero
+    PROXIMITY_INIT_GAP_MIN = 0.005  # m: floor on d0 so a near-zero start cannot blow up the scale
     PROXIMITY_REWARD_SHARPNESS = 5.0  # K: larger = more concentrated near d = 0
     EE_HOLD_Z_TARGET = 0.8
     EE_HOLD_Z_TOLERANCE = 0.025
@@ -233,7 +232,7 @@ class FrankaEnvParallelTilted:
     # Z_VEL_MAX, so the cost is about SPEED_PENALTY_WEIGHT at full commanded speed,
     # 0.16 x that at 0.2 m/s and effectively nothing just outside the deadzone: enough to
     # bias the policy towards slow motion without pricing the approach out of reach.
-    SPEED_PENALTY_WEIGHT = 2.25
+    SPEED_PENALTY_WEIGHT = 4.5
     # Commanded-velocity sign flip, charged at every step (not only in the lockout) and in
     # proportion to the size of the jump across zero: a 0.2 m/s flip costs 5, 0.8 m/s costs 20.
     VEL_SIGN_FLIP_PENALTY_PER_MPS = 0.0
@@ -298,7 +297,7 @@ class FrankaEnvParallelTilted:
         self.normalize = normalize
         self.extras: dict = {}
         self.cfg = {
-            "environment": "env_franka_parallel_tilted",
+            "environment": "env_franka_parallel_tilted_no_force",
             "coordinate_frame": "fixed_home_grasp",
             "tilt_deg": self.tilt_deg,
             "home_task_z": self.HOME_TASK_Z,
@@ -510,6 +509,8 @@ class FrankaEnvParallelTilted:
             self._prev_cuboid_rel_z = torch.zeros(N, device=self.device)
             # Regrasp improvement tracking: cuboid_rel_z at the moment of release
             self._release_cuboid_rel_z = torch.zeros(N, device=self.device)
+            # Proximity scale: gap at the first reward step of the episode (< 0 = not yet recorded)
+            self._init_proximity_gap = torch.full((N,), -1.0, device=self.device)
             # 2nd-order low-pass filter state (z-vel command path)
             self._filt_u1 = torch.zeros(N, device=self.device)  # u[n-1]
             self._filt_u2 = torch.zeros(N, device=self.device)  # u[n-2]
@@ -575,6 +576,7 @@ class FrankaEnvParallelTilted:
         self._regrasp_duration_steps[envs_idx] = 0
         self._prev_cuboid_rel_z[envs_idx] = 0.0
         self._release_cuboid_rel_z[envs_idx] = 0.0
+        self._init_proximity_gap[envs_idx] = -1.0
         self._firm_grasp_steps[envs_idx] = 0
         self._success_steps[envs_idx] = 0
         self._pre_success[envs_idx] = False
@@ -759,12 +761,6 @@ class FrankaEnvParallelTilted:
         left_ft = self._fingertip_pos(self.left_finger)  # (N, 3)
         right_ft = self._fingertip_pos(self.right_finger)  # (N, 3)
 
-        link_forces = self.franka.get_links_net_contact_force()  # (N, n_links, 3)
-        left_force = link_forces[:, self.left_finger.idx_local, :]  # (N, 3)
-        right_force = link_forces[:, self.right_finger.idx_local, :]  # (N, 3)
-        left_force_mag = left_force.norm(dim=-1, keepdim=True)  # (N, 1)
-        right_force_mag = right_force.norm(dim=-1, keepdim=True)  # (N, 1)
-
         finger_mid = (left_ft + right_ft) / 2.0  # (N, 3)
         cuboid_rel = self._world_vector_to_task(cuboid_pos - finger_mid)
         ee_task_z = self._task_position_z(ee_pos)
@@ -781,19 +777,17 @@ class FrankaEnvParallelTilted:
                 ee_task_vel[:, 2:3] + _unoise((_N, 1)),  # [1]    ee_vel_z
                 self.target_z_vel.unsqueeze(-1),  # [2]    target_z_vel
                 self.target_z_acc.unsqueeze(-1),  # [3]    target_z_acc
-                left_force_mag,  # [4]    left_force_mag
-                right_force_mag,  # [5]    right_force_mag
-                cuboid_rel[:, 2:3] + _unoise((_N, 1)),  # [6]    cuboid_rel_z
-                cuboid_rel[:, 0:1] + _unoise((_N, 1)),  # [7]    cuboid_rel_x
-                cuboid_rel[:, 1:2] + _unoise((_N, 1)),  # [8]    cuboid_rel_y
-                self.desired_rel_z.unsqueeze(-1),  # [9]    desired_rel_z
+                cuboid_rel[:, 2:3] + _unoise((_N, 1)),  # [4]    cuboid_rel_z
+                cuboid_rel[:, 0:1] + _unoise((_N, 1)),  # [5]    cuboid_rel_x
+                cuboid_rel[:, 1:2] + _unoise((_N, 1)),  # [6]    cuboid_rel_y
+                self.desired_rel_z.unsqueeze(-1),  # [7]    desired_rel_z
                 # TODO: Future observations to be appended here:
-                # [10] last_pulse_gap_z_improve: LAST PULSE GAP z improvement
-                # [11] pulse_gap_duration: duration of gap derived from finger pos
-                # [12] acc_drop_to_open_delay: delay (ms) from EE acceleration going below -10.0 to EE open (can be +/-)
+                # [8]  last_pulse_gap_z_improve: LAST PULSE GAP z improvement
+                # [9]  pulse_gap_duration: duration of gap derived from finger pos
+                # [10] acc_drop_to_open_delay: delay (ms) from EE acceleration going below -10.0 to EE open (can be +/-)
             ],
             dim=-1,
-        )  # (N, 10)
+        )  # (N, 8)
 
         if self.normalize:
             if not hasattr(self, "_obs_scale_t"):
@@ -968,6 +962,7 @@ class FrankaEnvParallelTilted:
             raw_regrasp_bonus * 5.0,
             raw_regrasp_bonus,
         )
+        # raw_regrasp_bonus = raw_regrasp_bonus.clamp(min=-1000.0)
         # Bonus only for the first REGRASP_BONUS_MAX_COUNT regrasps. _regrasp_count was
         # already incremented above, so the k-th regrasp event sees _regrasp_count == k.
         bonus_eligible = regrasp_event & (self._regrasp_count <= self.REGRASP_BONUS_MAX_COUNT)
@@ -978,9 +973,16 @@ class FrankaEnvParallelTilted:
         # fingers and where it was asked to sit. Paid every step, so it shapes the
         # approach instead of only scoring the regrasp that caused it.
         proximity_gap = (cuboid_rel_z - self.desired_rel_z).abs()  # (N,) metres
+        # The first reward step after a reset records the starting gap; the episode is
+        # scored against it, so every commanded offset runs from 0 at the start to MAX.
+        self._init_proximity_gap = torch.where(
+            self._init_proximity_gap < 0.0,
+            proximity_gap.clamp(min=self.PROXIMITY_INIT_GAP_MIN),
+            self._init_proximity_gap,
+        )
         _k = self.PROXIMITY_REWARD_SHARPNESS
         _floor = math.exp(-_k)
-        _decay = torch.exp(-_k * proximity_gap / self.PROXIMITY_REWARD_RANGE)
+        _decay = torch.exp(-_k * proximity_gap / self._init_proximity_gap)
         proximity_reward = self.PROXIMITY_REWARD_MAX * (_decay - _floor) / (1.0 - _floor)
         proximity_reward = proximity_reward.clamp(0.0, self.PROXIMITY_REWARD_MAX)  # (N,)
 
@@ -1149,6 +1151,7 @@ class FrankaEnvParallelTilted:
         self._regrasp_duration_steps[envs_idx] = 0
         self._prev_cuboid_rel_z[envs_idx] = 0.0
         self._release_cuboid_rel_z[envs_idx] = 0.0
+        self._init_proximity_gap[envs_idx] = -1.0
         self._firm_grasp_steps[envs_idx] = 0
         self._success_steps[envs_idx] = 0
         self._filt_u1[envs_idx] = 0.0
@@ -1471,7 +1474,7 @@ class FrankaEnvParallelTilted:
 
 # ---------------------------------------------------------------------------
 # Canonical name supported by the existing training/evaluation module loaders.
-FrankaEnvParallel = FrankaEnvParallelTilted
+FrankaEnvParallel = FrankaEnvParallelTiltedNoForce
 
 # Minimal smoke-test
 # ---------------------------------------------------------------------------

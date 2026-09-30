@@ -99,18 +99,18 @@ def set_pulse(target, ranges: dict, delay=None, length=None) -> None:
 
     `None` means "randomize as the env normally would". `target` is the env
     class (before construction) or the instance (after); the samplers read
-    these off `self`, so either works. This script always runs randomize=True,
-    so only the RANDOM_MIN/MAX pair drives the samplers -- PULSE_DELAY_STEPS /
-    PULSE_LENGTH are set alongside it purely to keep the two consistent.
+    these off `self`, so either works. PULSE_DELAY_STEPS / PULSE_LENGTH are
+    written on every call, not only when the parameter is pinned: an env whose
+    sampler ignores the RANDOM_MIN/MAX pair and always uses the fixed constant
+    (env_franka_parallel_tilted pins its delay that way) would otherwise carry
+    the previous sweep point's pinned value into the un-pinned arm.
     """
     d_lo, d_hi = (int(delay), int(delay)) if delay is not None else ranges["delay"]
     l_lo, l_hi = (int(length), int(length)) if length is not None else ranges["length"]
     target.PULSE_DELAY_RANDOM_MIN, target.PULSE_DELAY_RANDOM_MAX = d_lo, d_hi
     target.PULSE_LENGTH_RANDOM_MIN, target.PULSE_LENGTH_RANDOM_MAX = l_lo, l_hi
-    if delay is not None:
-        target.PULSE_DELAY_STEPS = int(delay)
-    if length is not None:
-        target.PULSE_LENGTH = int(length)
+    target.PULSE_DELAY_STEPS = d_lo
+    target.PULSE_LENGTH = l_lo
 
 
 def observed_pulse(env) -> dict:
