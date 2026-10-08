@@ -1,9 +1,13 @@
 """Franka regrasp with a configurable fixed grasp-axis tilt from 0 to 45 degrees,
-without finger contact forces in the observation.
+without the two finger force observations.
 
-Copy of env_franka_parallel_tilted with left_force_mag and right_force_mag removed
-from the observation (8 channels instead of 10). Rewards, success and failure still
-read the finger contact forces internally; only the policy no longer sees them.
+Derived from env_franka_parallel_tilted: same control path and task frame, but the
+observation vector drops left_force_mag and right_force_mag (OBS_DIM is 8 instead of
+10) and the reward is its own -- a progress-based task reward plus style costs shaped
+around one reciprocating stroke; see the reward constants on the class. Finger contact
+force is still measured inside the reward -- it is privileged simulator state, not a
+policy input -- so release, regrasp and firm-grasp detection do not need the
+observations.
 
 ``tilt_deg`` is inclination from world vertical, toward the pictured joint-5
 homing direction (approximately world +Y), not an absolute Euler pitch angle.
@@ -13,12 +17,14 @@ original joint home, object alignment, and world-coordinate task axes.
 All Z names refer to the fixed tilted grasp axis. Position coordinates are
 HOME_TASK_Z plus displacement along that axis from home. Observations, reward
 formulas, success/failure distances and hold targets use this same frame.
-The tilt is fixed for the run and is not an additional observation. Gravity stays world-down.
+The tilt is fixed for the run and is not an additional observation. Policies
+trained here read 8 channels, so they are not interchangeable with the 10-channel
+env_franka_parallel_tilted. Gravity stays world-down.
 Transverse and orientation feedback hold the line and home quaternion; axial
 position gain, action filter, reward weights and action scales are retained.
 
 Train:
-    python examples/rigid/train_franka_ppo.py --env env_franka_parallel_tilted_no_force --tilt-deg 20 -e franka-tilted20-no-force
+    python examples/rigid/train_franka_ppo.py --env env_franka_parallel_tilted_no_force --tilt-deg 20 -e franka-tilted20-nf
 Preview:
     python examples/rigid/env_franka_parallel_tilted_no_force.py -B 1 --vis --tilt-deg 45
 """
@@ -81,7 +87,7 @@ def _tc_quat_mul(u: torch.Tensor, v: torch.Tensor) -> torch.Tensor:
 
 class FrankaEnvParallelTiltedNoForce:
     """
-    Vectorised tilted Franka environment.
+    Vectorised tilted Franka environment without finger force observations.
 
     Z is the fixed home grasp axis; it does not rotate with tracking errors.
     EE positions use HOME_TASK_Z + displacement from home along that axis.
@@ -97,6 +103,9 @@ class FrankaEnvParallelTiltedNoForce:
         [6]    cuboid_rel_y
         [7]    desired_rel_z
 
+        Not observed: left_force_mag, right_force_mag. The reward still reads
+        finger contact force from the simulator; the policy does not see it.
+
         Future Observations (To be added):
         [8]    last_pulse_gap_z_improve (LAST PULSE GAP z improvement)
         [9]    pulse_gap_duration (Duration of gap derived from finger pos)
@@ -105,6 +114,10 @@ class FrankaEnvParallelTiltedNoForce:
     Actions (per env, shape (N, action_dim=3)):
         [0]   target_z_vel
         [1:3] gripper_pos (left, right finger)
+
+    Reward: progress towards the commanded offset plus success / fail / time, and style
+    costs (upward acceleration, jerk, motion during the wait, refused pulse requests) that
+    the intended stroke does not pay. Described in full next to the reward constants.
     """
 
     DEFAULT_TILT_DEG = 30.0
@@ -131,82 +144,117 @@ class FrankaEnvParallelTiltedNoForce:
     # Order: ee_pos_z, ee_vel_z, target_z_vel, target_z_acc,
     #        cuboid_rel_z, cuboid_rel_x, cuboid_rel_y, desired_rel_z
     #        (Future: last_pulse_gap_z_improve, pulse_gap_duration, acc_drop_to_open_delay)
+    # Same scales as env_franka_parallel_tilted with the two 5.0 force entries removed.
     OBS_SCALE = [1.0, 0.6, 0.6, 15.0, 0.05, 0.05, 0.05, 0.05]
 
-    # Weights applied to each additive reward component in _compute_done_and_reward.
-    # Also read by reward_table.RewardTermTracker for the per-iteration table.
-    # Only the keys listed here are summed into rew_buf. post_pulse_hold_penalty
-    # is still computed but does not contribute; its countdowns remain active.
-    # base_reward carries the terminal signal (success payout, fail/timeout penalty,
-    # per-step alive cost). Without it the dense proximity term makes loitering near
-    # the target strictly better than finishing, so it stays in the sum.
+    # ------------------------------------------------------------------ #
+    # Reward                                                              #
+    # ------------------------------------------------------------------ #
+    # One stroke of the intended motion: hold still for WAIT_DURATION, climb at no more
+    # than ACC_UP_LIMIT, fire the pulse and reverse hard so the object slides up in the
+    # open fingers, keep descending until they have closed again, brake gently to rest.
+    #
+    # Task terms pay for the outcome:
+    #   progress_reward  PROGRESS_REWARD x the fraction of the starting gap closed. Banked
+    #                    whenever the fingers hold the object, so a stroke is paid on the
+    #                    regrasp; moving away is charged at the same rate. Closing the
+    #                    whole gap is worth PROGRESS_REWARD however far the target is.
+    #   regrasp_bonus    A learning aid on top of progress, meant to be switched off (weight
+    #                    0) once the stroke is learned. Paid on a regrasp that leaves the
+    #                    object closer to the target than at any earlier point of the
+    #                    episode, and exponentially more for a bigger gain: 100 for 1 mm
+    #                    of new ground, 1000 for 5 mm, at most REGRASP_BONUS_CAP. Only new
+    #                    ground counts, so sliding the object away and back earns nothing
+    #                    a second time.
+    #                    The bonus is then multiplied by a factor set by the hand height
+    #                    (ee_z) at which the pulse behind that regrasp fired: 0.5 at
+    #                    0.65 m, rising in a straight line to 1.0 at 0.85 m, and flat
+    #                    outside that range.
+    #   success_reward   SUCCESS_REWARD once, on settling inside the success tolerance.
+    #   fail_penalty     FAIL_PENALTY once, on any failure termination.
+    #   time_penalty     TIME_PENALTY every step, so finishing beats loitering.
+    #   wait_penalty     WAIT_PENALTY x (commanded speed / Z_VEL_MAX)^2, only in the wait
+    #                    window: the first PULSE_START_MIN_STEPS of an episode, and from
+    #                    STROKE_SETTLE_DURATION after each pulse until the lockout ends.
+    #                    Holding still there is part of the task, so it is charged at
+    #                    full weight. A whole episode of it must stay cheaper than
+    #                    FAIL_PENALTY, or leaving the range becomes the way to stop paying.
+    #                    With ENFORCE_WAIT_HOLD the env already holds the hand there, so
+    #                    all this can still charge is the short braking ramp into the hold.
+    # Style terms cost nothing along the intended stroke and are all scaled by
+    # STYLE_SCALE. They are computed on the commanded motion, so they also charge the
+    # policy's own exploration noise: measured on an idle policy over one 450-step
+    # episode at scale 1, the acceleration + jerk terms cost about 30 at an action std
+    # of 0.05, 210 at 0.1, 5600 at 0.3 and 7700 at 1.0 -- against roughly 1750 for a
+    # perfect episode. So STYLE_SCALE is a curriculum knob: keep it small while the
+    # policy is still noisy and finding the task, and raise it towards 1.0 (edit, then
+    # --resume) once successes are common and the action std has come down:
+    #   acc_up_penalty   commanded upward acceleration above ACC_UP_LIMIT; ACC_UP_PENALTY
+    #                    per step at the full +Z_ACC_MAX. The reversal is downward: free.
+    #                    With ENFORCE_ACC_UP_LIMIT the env caps the command at the limit,
+    #                    so this term stays at zero.
+    #   jerk_penalty     JERK_PENALTY x (change in commanded acceleration / Z_ACC_MAX)^2.
+    #   blocked_pulse_penalty  BLOCKED_PULSE_PENALTY per pulse request the env refuses.
+    PROGRESS_REWARD = 900.0
+    PROGRESS_MIN = -0.5  # progress is clipped here, so one bad release costs at most half
+    # Two (gain in metres, bonus) points the regrasp bonus passes through. From the small
+    # point upwards it is the exponential through both (x10 every 4 mm with these values),
+    # capped at the top; below the small point it falls in a straight line to zero.
+    REGRASP_BONUS_SMALL = (0.001, 100.0)
+    REGRASP_BONUS_LARGE = (0.005, 1000.0)
+    REGRASP_BONUS_RATE = math.log(REGRASP_BONUS_LARGE[1] / REGRASP_BONUS_SMALL[1]) / (
+        REGRASP_BONUS_LARGE[0] - REGRASP_BONUS_SMALL[0]
+    )  # 1/m
+    REGRASP_BONUS_CAP = 4000.0  # reached at about 7.4 mm of new ground in one regrasp
+    # Multiplier on the regrasp bonus from the hand height (ee_z, metres) at which the pulse
+    # fired: a straight line through the two (height, multiplier) points, flat outside them.
+    REGRASP_BONUS_HEIGHT_LOW = (0.65, 0.5)
+    REGRASP_BONUS_HEIGHT_HIGH = (0.85, 1.0)
+    SUCCESS_REWARD = 1000.0
+    FAIL_PENALTY = 2000.0  # keep above what a whole episode of wait_penalty can cost
+    TIME_PENALTY = 0.5
+    ACC_UP_LIMIT = 5.0  # m/s^2
+    ACC_UP_PENALTY = 100.0
+    JERK_PENALTY = 2.0
+    WAIT_PENALTY = 5.0  # per step at full speed; not scaled by STYLE_SCALE
+    BLOCKED_PULSE_PENALTY = 5.0
+    STYLE_SCALE = 0.25 # stage 1; the weights above are sized for 1.0
+
+    # Weights applied to each term in _compute_done_and_reward; also read by
+    # reward_table.RewardTermTracker for the per-iteration table.
     REWARD_TERM_WEIGHTS = {
-        "base_reward": 1.0,
-        "proximity_reward": 1.0,
-        "regrasp_bonus": 2.0,
-        "z_acc_penalty": 1.0,
-        "jerk_penalty": 1.0,
-        "vel_sign_flip_penalty": 1.0,
-        "blockade_motion_penalty": 1.0,
-        "speed_penalty": 1.0,
+        "progress_reward": 1.0,
+        "regrasp_bonus": 2.0,  # set to 0 to switch the bonus off
+        "success_reward": 1.0,
+        "fail_penalty": 1.0,
+        "time_penalty": 1.0,
+        "acc_up_penalty": STYLE_SCALE,
+        "jerk_penalty": STYLE_SCALE,
+        "wait_penalty": 1.0,
+        "blocked_pulse_penalty": STYLE_SCALE,
     }
 
     # Action scaling constants
     Z_VEL_MAX = 0.45
     Z_ACC_MAX = 15.00  # m/s² — hard limit on target-velocity rate of change
-    Z_ACC_PENALTY_THRESHOLD = 0.0
-    # At the default outer reward weights, saturated alternating acceleration costs
-    # 25 + 25 = 50 per step, or 1500 over 30 unrefunded steps (1481.25 from rest).
-    Z_ACC_PENALTY_WEIGHT = 35.0
-    JERK_PENALTY_WEIGHT = 35.0  # squared acceleration change / (2 * Z_ACC_MAX)
-    SMOOTHNESS_REFUND_STEPS = 6  # preceding charged steps refunded on an accepted pulse trigger
-    SMOOTHNESS_FREE_STEPS_AFTER_PULSE = 8  # firing step is also free: 9 steps total
-    EE_Z_TARGET = 0.7
     GRIPPER_CLOSED = 0.000251
     GRIPPER_OPEN = 0.0130  # per finger; gap 26.0 mm clears the 25 mm block by 1.0 mm
     # Release-to-regrasp detection
     FORCE_FREE_THRESHOLD = 0.15  # N: avg finger force below this -> fully released
     REGRASP_FORCE_THRESHOLD = 0.75  # N: avg finger force at/above this -> firm grasp
-    AMBIGUOUS_FORCE_PENALTY = 10.0
-    FREE_FORCE_REWARD = 1.0
-    REGRASP_BONUS = 75.0  # duration-weighted reward scale for successful regrasp events
     REGRASP_TERMINATION_COUNT = 7  # fail on the 7th regrasp if not successful by then
-    REGRASP_BONUS_MAX_COUNT = 4  # regrasp bonus paid only for the first 4 regrasps
-    REGRASP_BONUS_CAP = 10000.0  # positive raw bonus cap, before REWARD_TERM_WEIGHTS
-    FIRM_GRASP_SLIP_PENALTY_WEIGHT = 30.0  # harsh penalty per (m/step)² of Z-slip during firm grasp
+    # Success: object within SUCCESS_GAP_TOLERANCE of the commanded offset, held firmly,
+    # hand inside the Z band and slower than SUCCESS_EE_VEL_MAX, for SUCCESS_REQUIRED_STEPS.
+    SUCCESS_GAP_TOLERANCE = 0.005  # m
     SUCCESS_EE_Z_MIN = 0.7
     SUCCESS_EE_Z_MAX = 0.86
     SUCCESS_EE_VEL_MAX = 0.05  # m/s: |ee_vel_z| must be below this to count as settled
-    # Terminal and per-step base reward. Failing must always cost more than surviving to
-    # the timeout, otherwise ending an episode early is the cheapest outcome. The fail
-    # penalty is derived from these in _compute_done_and_reward, so that stays true if
-    # any of them or max_episode_length change.
-    SUCCESS_REWARD = 10000.0  # +25 % over the previous 3000
-    SUCCESS_TIME_PENALTY = 0.3  # per episode step, subtracted from SUCCESS_REWARD
-    ALIVE_PENALTY = 1.25  # per non-terminal step
-    TIMEOUT_PENALTY = 4000.0
-    # fail = TIMEOUT + ALIVE * max_episode_length + margin = 4000 + 562.5 + 437.5 = 5000
-    FAIL_PENALTY_MARGIN = 437.5
-    SUCCESS_REQUIRED_STEPS = 5
-    # Dense proximity reward on the grasp-axis gap to the commanded offset.
-    # r(d) = MAX * (exp(-K*d/d0) - exp(-K)) / (1 - exp(-K)), clamped to [0, MAX],
-    # where d0 is the gap measured on the first step of the episode. Every episode
-    # therefore starts at 0 and reaches MAX at d = 0 whatever its commanded offset;
-    # drifting past the starting gap is clamped to 0 -- never negative.
-    # With K = 5: d/d0 = 1 -> 0.0, 0.5 -> 2.3, 0.25 -> 8.5, 0.1 -> 18.1, 0 -> 30.0.
-    PROXIMITY_REWARD_MAX = 30.0
-    PROXIMITY_INIT_GAP_MIN = 0.005  # m: floor on d0 so a near-zero start cannot blow up the scale
-    PROXIMITY_REWARD_SHARPNESS = 5.0  # K: larger = more concentrated near d = 0
-    EE_HOLD_Z_TARGET = 0.8
-    EE_HOLD_Z_TOLERANCE = 0.025
-    EE_HOLD_VEL_TOLERANCE = 0.02
-    EE_HOLD_REQUIRED_STEPS = 5
-    EE_HOLD_ACC_THRESHOLD = 2.0
-    # Fixed at 2 steps = 40 ms, with or without --randomize: the delay is no longer a
+    SUCCESS_REQUIRED_STEPS = 2
+    # Fixed at 2 steps = 40 ms, with or without --randomize: the delay is not a
     # domain-randomised quantity, so every episode sees the same command-to-open lag.
     PULSE_DELAY_STEPS = 2  # target-period steps to wait before the open window begins
     # Read by the pulse sweep tooling (eval_test_franka_delays, test_gripper_pulse_plot),
-    # which captures and pins these. They no longer drive _sample_gripper_pulse_delays;
+    # which captures and pins these. They do not drive _sample_gripper_pulse_delays;
     # they are held at PULSE_DELAY_STEPS so a captured "native range" is the truth.
     PULSE_DELAY_RANDOM_MIN = 2  # 40 ms
     PULSE_DELAY_RANDOM_MAX = 2  # 40 ms
@@ -218,38 +266,36 @@ class FrankaEnvParallelTiltedNoForce:
     # 8 steps = 160 ms, of which the last 120 ms are forced open whatever the policy asks.
     PULSE_LENGTH_RANDOM_MIN = 7
     PULSE_LENGTH_RANDOM_MAX = 7
-    # Pulse lockout: no new pulse may start until this long after the previous TRIGGER.
-    PULSE_START_MIN_STEPS = 50  # no pulse may fire in the first N steps of an episode
-    PULSE_LOCKOUT_DURATION = 1.2  # s since the trigger before another pulse may fire
-    # Discourage motion while waiting; leave room to settle and prepare the next release.
-    BLOCKADE_SETTLE_DURATION = 0.30  # s since trigger, including the active pulse
-    BLOCKADE_PREP_DURATION = 0.20  # s before opening becomes available
-    BLOCKADE_VEL_TOLERANCE = 0.02  # m/s: deadzone for measured grasp-axis speed
-    BLOCKADE_VEL_SCALE = 0.10  # m/s: normalisation for both velocity costs
-    BLOCKADE_COMMAND_WEIGHT = 0.25  # relative cost of commanded velocity
-    # Grasp-axis speed penalty, charged in every period instead of only while opening is
-    # blocked. Reuses the blockade deadzone for the measured speed but normalises by
-    # Z_VEL_MAX, so the cost is about SPEED_PENALTY_WEIGHT at full commanded speed,
-    # 0.16 x that at 0.2 m/s and effectively nothing just outside the deadzone: enough to
-    # bias the policy towards slow motion without pricing the approach out of reach.
-    SPEED_PENALTY_WEIGHT = 4.5
-    # Commanded-velocity sign flip, charged at every step (not only in the lockout) and in
-    # proportion to the size of the jump across zero: a 0.2 m/s flip costs 5, 0.8 m/s costs 20.
-    VEL_SIGN_FLIP_PENALTY_PER_MPS = 0.0
-    # Post-pulse hold penalty: after pulse completes, wait 0.5s, then penalise instability for 0.5s
-    POST_PULSE_DELAY_DURATION = 0.5  # wait before evaluation window
-    POST_PULSE_HOLD_DURATION = 0.5  # seconds
-    POST_PULSE_HOLD_PENALTY_Z = 200.0  # per-step penalty weight for distance from target
-    POST_PULSE_HOLD_PENALTY_VEL = 200.0  # per-step penalty weight for velocity excess
-    POST_PULSE_HOLD_Z_TARGET = 0.8  # desired ee_z during hold
-    POST_PULSE_HOLD_VEL_MAX = 0.03  # deadzone for velocity penalty
+    # Pulse availability, which is also what defines the wait. No pulse can fire in the
+    # first PULSE_START_MIN_STEPS of an episode, nor until PULSE_LOCKOUT_DURATION after the
+    # previous trigger. The lockout is the time a stroke is given to finish after its
+    # trigger (reversal, descent until the fingers close, braking) plus the wait itself.
+    STROKE_SETTLE_DURATION = 0.3  # s
+    WAIT_DURATION = 1.0  # s of stillness between strokes
+    PULSE_START_MIN_STEPS = 50  # the opening wait, in steps: WAIT_DURATION at target_dt 0.02
+    PULSE_LOCKOUT_DURATION = STROKE_SETTLE_DURATION + WAIT_DURATION  # s since the trigger
+    # Enforced stillness. With this on, the env itself holds the hand during the wait window
+    # (the opening PULSE_START_MIN_STEPS, and from STROKE_SETTLE_DURATION after each trigger
+    # until the lockout ends): the policy's velocity action is ignored there, the commanded
+    # speed is brought to zero at no more than HOLD_BRAKE_ACC and then kept at zero. The
+    # policy sees the result in its target_z_vel / target_z_acc observations. A robot
+    # controller running this policy has to apply exactly the same rule. Set to False for
+    # the old behaviour, where stillness is only encouraged by wait_penalty.
+    ENFORCE_WAIT_HOLD = True
+    HOLD_BRAKE_ACC = ACC_UP_LIMIT  # m/s^2; at the upward limit, so the braking is never penalised
+    # Enforced acceleration limit. With this on, the env caps the upward commanded acceleration
+    # (speeding up, or braking out of a descent) at ACC_UP_LIMIT, whatever the policy asks for;
+    # downward acceleration keeps Z_ACC_MAX, so the reversal at the top of a stroke stays
+    # sharp. acc_up_penalty can then never fire. A robot controller running this policy has
+    # to apply the same asymmetric cap. Set to False for the old behaviour (penalty only).
+    ENFORCE_ACC_UP_LIMIT = True
     FINGER_GAIN_RANDOM_MIN = 100.0
     FINGER_GAIN_RANDOM_MAX = 500.0
     # Friction domain randomisation: effective contact μ sampled each episode
     FRICTION_BASE = 0.75  # sliding friction in the MJCF files (dominant value)
-    FRICTION_MIN = 0.6  # minimum desired effective contact friction
-    FRICTION_RANDOM_MIN = 0.15  # replaces FRICTION_MIN when randomize is on
-    FRICTION_MAX = 0.90  # maximum desired effective contact friction
+    FRICTION_MIN = 0.2  # minimum desired effective contact friction
+    FRICTION_RANDOM_MIN = 0.2  # replaces FRICTION_MIN when randomize is on (same range now)
+    FRICTION_MAX = 0.5  # maximum desired effective contact friction
 
     def __init__(
         self,
@@ -321,15 +367,21 @@ class FrankaEnvParallelTiltedNoForce:
             "success_ee_z_max": self.SUCCESS_EE_Z_MAX,
             "success_ee_vel_max": self.SUCCESS_EE_VEL_MAX,
             "success_reward": self.SUCCESS_REWARD,
-            "alive_penalty": self.ALIVE_PENALTY,
-            "timeout_penalty": self.TIMEOUT_PENALTY,
-            "fail_penalty": self.fail_penalty(),
+            "fail_penalty": self.FAIL_PENALTY,
+            "progress_reward": self.PROGRESS_REWARD,
+            "time_penalty": self.TIME_PENALTY,
+            "acc_up_limit": self.ACC_UP_LIMIT,
+            "acc_up_penalty": self.ACC_UP_PENALTY,
+            "jerk_penalty": self.JERK_PENALTY,
+            "wait_penalty": self.WAIT_PENALTY,
+            "blocked_pulse_penalty": self.BLOCKED_PULSE_PENALTY,
+            "style_scale": self.STYLE_SCALE,
+            "wait_duration": self.WAIT_DURATION,
+            "enforce_wait_hold": self.ENFORCE_WAIT_HOLD,
+            "enforce_acc_up_limit": self.ENFORCE_ACC_UP_LIMIT,
+            "hold_brake_acc": self.HOLD_BRAKE_ACC,
+            "stroke_settle_duration": self.STROKE_SETTLE_DURATION,
             "success_required_steps": self.SUCCESS_REQUIRED_STEPS,
-            "ee_hold_z_target": self.EE_HOLD_Z_TARGET,
-            "ee_hold_z_tolerance": self.EE_HOLD_Z_TOLERANCE,
-            "ee_hold_vel_tolerance": self.EE_HOLD_VEL_TOLERANCE,
-            "ee_hold_required_steps": self.EE_HOLD_REQUIRED_STEPS,
-            "ee_hold_acc_threshold": self.EE_HOLD_ACC_THRESHOLD,
             "pulse_delay": self.PULSE_DELAY_STEPS,
             "pulse_delay_random_min": self.PULSE_DELAY_RANDOM_MIN,
             "pulse_delay_random_max": self.PULSE_DELAY_RANDOM_MAX,
@@ -338,14 +390,6 @@ class FrankaEnvParallelTiltedNoForce:
             "pulse_length_random_max": self.PULSE_LENGTH_RANDOM_MAX,
             "pulse_start_min_steps": self.PULSE_START_MIN_STEPS,
             "pulse_lockout_duration": self.PULSE_LOCKOUT_DURATION,
-            "vel_sign_flip_penalty_per_mps": self.VEL_SIGN_FLIP_PENALTY_PER_MPS,
-            "speed_penalty_weight": self.SPEED_PENALTY_WEIGHT,
-            "z_acc_penalty_threshold": self.Z_ACC_PENALTY_THRESHOLD,
-            "z_acc_penalty_weight": self.Z_ACC_PENALTY_WEIGHT,
-            "jerk_penalty_weight": self.JERK_PENALTY_WEIGHT,
-            "smoothness_refund_steps": self.SMOOTHNESS_REFUND_STEPS,
-            "smoothness_free_steps_after_pulse": self.SMOOTHNESS_FREE_STEPS_AFTER_PULSE,
-            "regrasp_bonus_cap": self.REGRASP_BONUS_CAP,
             "finger_gain_random_min": self.FINGER_GAIN_RANDOM_MIN,
             "finger_gain_random_max": self.FINGER_GAIN_RANDOM_MAX,
         }
@@ -494,6 +538,7 @@ class FrankaEnvParallelTiltedNoForce:
             # Release-to-regrasp tracking
             self._in_release = torch.zeros(N, dtype=torch.bool, device=self.device)
             self._regrasp_count = torch.zeros(N, dtype=torch.long, device=self.device)
+            # Regrasps this episode that ended further from the commanded offset.
             self._release_start_step = torch.full((N,), -1, dtype=torch.long, device=self.device)
             self._last_regrasp_duration_steps = torch.zeros(N, dtype=torch.long, device=self.device)
             self._regrasp_duration_sum_steps = torch.zeros(N, dtype=torch.long, device=self.device)
@@ -509,8 +554,6 @@ class FrankaEnvParallelTiltedNoForce:
             self._prev_cuboid_rel_z = torch.zeros(N, device=self.device)
             # Regrasp improvement tracking: cuboid_rel_z at the moment of release
             self._release_cuboid_rel_z = torch.zeros(N, device=self.device)
-            # Proximity scale: gap at the first reward step of the episode (< 0 = not yet recorded)
-            self._init_proximity_gap = torch.full((N,), -1.0, device=self.device)
             # 2nd-order low-pass filter state (z-vel command path)
             self._filt_u1 = torch.zeros(N, device=self.device)  # u[n-1]
             self._filt_u2 = torch.zeros(N, device=self.device)  # u[n-2]
@@ -518,6 +561,14 @@ class FrankaEnvParallelTiltedNoForce:
             self._filt_y2 = torch.zeros(N, device=self.device)  # y[n-2]
             # Gripper pulse state: counter length..2 → force max, 1 → force min, 0 → policy
             self._gripper_pulse_steps = torch.zeros(N, dtype=torch.long, device=self.device)
+            # Pulses actually fired this episode. Zero at the terminal step means the task
+            # was never attempted; see no_pulse_penalty.
+            self._pulse_count = torch.zeros(N, dtype=torch.long, device=self.device)
+            # Previous RAW requested finger command, and whether the step just executed
+            # carried a trigger request that a block refused. Written by step(), read by
+            # the reward as blocked_pulse_penalty.
+            self._prev_gripper_req = torch.full((N,), self.gripper_pos_min.mean().item(), device=self.device)
+            self._blocked_pulse_now = torch.zeros(N, dtype=torch.bool, device=self.device)
             self._gripper_pulse_delays = torch.full((N,), self.PULSE_DELAY_STEPS, dtype=torch.long, device=self.device)
             self._gripper_pulse_lengths = torch.full((N,), self.PULSE_LENGTH, dtype=torch.long, device=self.device)
             self._prev_gripper_avg = torch.full((N,), self.gripper_pos_min.mean().item(), device=self.device)
@@ -527,13 +578,6 @@ class FrankaEnvParallelTiltedNoForce:
             self._steps_since_pulse = torch.full(
                 (N,), self._pulse_lockout_steps + 1, dtype=torch.long, device=self.device
             )
-            # Post-pulse hold countdown: high-level steps remaining in the hold window
-            _delay_hl_steps = max(1, int(round(self.POST_PULSE_DELAY_DURATION / self.target_period)))
-            _hold_hl_steps = max(1, int(round(self.POST_PULSE_HOLD_DURATION / self.target_period)))
-            self._post_pulse_delay_total = _delay_hl_steps
-            self._post_pulse_hold_total = _hold_hl_steps
-            self._post_pulse_delay_countdown = torch.zeros(N, dtype=torch.long, device=self.device)
-            self._post_pulse_hold_countdown = torch.zeros(N, dtype=torch.long, device=self.device)
             # Cubic-hermite segment state per env
             self._seg_start = None  # (N, 3): (z, z_vel, z_acc)
             self._seg_end = None  # (N, 3)
@@ -551,10 +595,11 @@ class FrankaEnvParallelTiltedNoForce:
         self.target_z_vel[envs_idx] = 0.0
         self.target_z_acc[envs_idx] = 0.0
         self.prev_target_z_vel[envs_idx] = 0.0
-        self._reset_smoothness_state(envs_idx)
+        self._reset_reward_state(envs_idx)
         self.direction_change_count[envs_idx] = 0
         _n = len(envs_idx)
-        _mag = 0.0125 + torch.rand(_n, device=self.device) * 0.01  # uniform in [0.0125, 0.0225]
+        _mag = 0.01 + torch.rand(_n, device=self.device) * 0.025  # uniform in [0.01, 0.02]
+        # _mag = 0.04
         # _mag = 0.0375
         if self.mix:
             _sign = torch.where(
@@ -576,7 +621,6 @@ class FrankaEnvParallelTiltedNoForce:
         self._regrasp_duration_steps[envs_idx] = 0
         self._prev_cuboid_rel_z[envs_idx] = 0.0
         self._release_cuboid_rel_z[envs_idx] = 0.0
-        self._init_proximity_gap[envs_idx] = -1.0
         self._firm_grasp_steps[envs_idx] = 0
         self._success_steps[envs_idx] = 0
         self._pre_success[envs_idx] = False
@@ -587,12 +631,13 @@ class FrankaEnvParallelTiltedNoForce:
         self._filt_y1[envs_idx] = 0.0
         self._filt_y2[envs_idx] = 0.0
         self._gripper_pulse_steps[envs_idx] = 0
+        self._pulse_count[envs_idx] = 0
+        self._prev_gripper_req[envs_idx] = self.gripper_pos_min.mean()
+        self._blocked_pulse_now[envs_idx] = False
         self._sample_gripper_pulse_delays(envs_idx)
         self._sample_gripper_pulse_lengths(envs_idx)
         self._randomize_finger_gains(envs_idx)
         self._prev_gripper_avg[envs_idx] = self.gripper_pos_min.mean()
-        self._post_pulse_delay_countdown[envs_idx] = 0
-        self._post_pulse_hold_countdown[envs_idx] = 0
         self._steps_since_pulse[envs_idx] = self._pulse_lockout_steps + 1
 
         self._seg_start = None
@@ -635,9 +680,22 @@ class FrankaEnvParallelTiltedNoForce:
             raise ValueError(f"actions must be ({self.num_envs}, {self.num_actions}), got {actions.shape}")
 
         new_z_vel = actions[:, 0].clamp(-1.0, 1.0) * self.Z_VEL_MAX  # (N,)
-        # Limit acceleration: |Δv| ≤ Z_ACC_MAX * target_period
-        max_dv = self.Z_ACC_MAX * self.target_period
-        new_z_vel = new_z_vel.clamp(self.target_z_vel - max_dv, self.target_z_vel + max_dv)
+        # Limit acceleration: downward |Δv| ≤ Z_ACC_MAX * target_period; upward Δv ≤ ACC_UP_LIMIT *
+        # target_period when ENFORCE_ACC_UP_LIMIT is on, else the same Z_ACC_MAX
+        max_dv_down = self.Z_ACC_MAX * self.target_period
+        max_dv_up = (self.ACC_UP_LIMIT if self.ENFORCE_ACC_UP_LIMIT else self.Z_ACC_MAX) * self.target_period
+        new_z_vel = new_z_vel.clamp(self.target_z_vel - max_dv_down, self.target_z_vel + max_dv_up)
+        if self.ENFORCE_WAIT_HOLD:
+            # The same window wait_penalty uses, read at the moment the action is applied
+            # (before this step's trigger logic touches the clock). Inside it the policy's
+            # velocity action is dropped and the command steps towards zero.
+            settle_steps = int(round(self.STROKE_SETTLE_DURATION / self.target_period))
+            in_hold = (self.episode_length_buf < self.PULSE_START_MIN_STEPS) | (
+                (self._steps_since_pulse >= settle_steps) & (self._steps_since_pulse < self._pulse_lockout_steps)
+            )  # (N,)
+            hold_dv = self.HOLD_BRAKE_ACC * self.target_period
+            hold_z_vel = self.target_z_vel - self.target_z_vel.clamp(-hold_dv, hold_dv)
+            new_z_vel = torch.where(in_hold, hold_z_vel, new_z_vel)
         gripper_raw = actions[:, 1:].clamp(-1.0, 1.0)  # (N, 2)
         gripper_pos = self.gripper_pos_min + (gripper_raw + 1.0) * 0.5 * (
             self.gripper_pos_max - self.gripper_pos_min
@@ -667,6 +725,19 @@ class FrankaEnvParallelTiltedNoForce:
             & (~_pulse_blocked)
         )  # (N,) rising-edge crossing, no active pulse, nothing blocking
         self._pulse_fired = _rising
+        self._pulse_count += _rising.long()
+        # The same upward crossing, but measured on the raw request and refused by a block.
+        # Using _prev_gripper_req (raw) rather than _prev_gripper_avg (effective, clamped
+        # shut while blocked) charges one distinct request once instead of every step the
+        # policy keeps asking. Reads _gripper_pulse_steps before the update below, exactly
+        # as _rising does.
+        self._blocked_pulse_now = (
+            (self._prev_gripper_req < _gp_mid)
+            & (_gp_avg >= _gp_mid)
+            & (self._gripper_pulse_steps == 0)
+            & _pulse_blocked
+        )  # (N,)
+        self._prev_gripper_req = _gp_avg
         self._gripper_pulse_steps = torch.where(_rising, _pulse_start, self._gripper_pulse_steps)
         # Trigger restarts the clock the lockout and the magnified window both read.
         self._steps_since_pulse = torch.where(
@@ -689,18 +760,6 @@ class FrankaEnvParallelTiltedNoForce:
         # holds "open" across the whole lockout therefore still produces a rising edge the
         # moment the lockout expires, instead of silently opening the fingers with no pulse.
         self._prev_gripper_avg = gripper_pos.mean(dim=-1)
-        # Detect pulse completion (close step, about to go 1 → 0) → start hold window
-        _pulse_just_completed = _in_close  # (N,) True on the final close step
-        self._post_pulse_delay_countdown = torch.where(
-            _pulse_just_completed,
-            torch.full_like(self._post_pulse_delay_countdown, self._post_pulse_delay_total),
-            self._post_pulse_delay_countdown,
-        )
-        self._post_pulse_hold_countdown = torch.where(
-            _pulse_just_completed,
-            torch.full_like(self._post_pulse_hold_countdown, self._post_pulse_hold_total),
-            self._post_pulse_hold_countdown,
-        )
         self._gripper_pulse_steps = (self._gripper_pulse_steps - 1).clamp(min=0)
 
         # Trapezoid integration for z
@@ -761,6 +820,8 @@ class FrankaEnvParallelTiltedNoForce:
         left_ft = self._fingertip_pos(self.left_finger)  # (N, 3)
         right_ft = self._fingertip_pos(self.right_finger)  # (N, 3)
 
+        # No contact force is read here: the policy does not observe it. The reward
+        # still samples it in _compute_done_and_reward.
         finger_mid = (left_ft + right_ft) / 2.0  # (N, 3)
         cuboid_rel = self._world_vector_to_task(cuboid_pos - finger_mid)
         ee_task_z = self._task_position_z(ee_pos)
@@ -807,64 +868,33 @@ class FrankaEnvParallelTiltedNoForce:
     # Done detection and partial reset                                    #
     # ------------------------------------------------------------------ #
 
-    def fail_penalty(self) -> float:
-        """Smallest-plus-margin fail cost that is always worse than timing out.
-
-        Failing at step t costs ALIVE*(t-1) + F, timing out costs ALIVE*(L-1) + TIMEOUT.
-        F > TIMEOUT + ALIVE*L makes the first larger for every t >= 1.
-        """
-        return self.TIMEOUT_PENALTY + self.ALIVE_PENALTY * self.max_episode_length + self.FAIL_PENALTY_MARGIN
-
-    def _reset_smoothness_state(self, envs_idx: torch.Tensor):
-        """Clear history and exemptions only for environments starting a new episode."""
-        if not hasattr(self, "_smoothness_history"):
+    def _reset_reward_state(self, envs_idx: torch.Tensor):
+        """Clear the per-episode history the reward reads."""
+        if not hasattr(self, "_banked_progress"):
             self.prev_target_z_acc = torch.zeros(self.num_envs, device=self.device)
             self._pulse_fired = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
-            self._smoothness_free_steps = torch.zeros(self.num_envs, dtype=torch.long, device=self.device)
-            self._smoothness_history = torch.zeros(self.num_envs, self.SMOOTHNESS_REFUND_STEPS, 2, device=self.device)
+            self._banked_progress = torch.zeros(self.num_envs, device=self.device)
+            self._best_gap = torch.zeros(self.num_envs, device=self.device)
+            self._pulse_ee_z = torch.zeros(self.num_envs, device=self.device)
         self.prev_target_z_acc[envs_idx] = 0.0
         self._pulse_fired[envs_idx] = False
-        self._smoothness_free_steps[envs_idx] = 0
-        self._smoothness_history[envs_idx] = 0.0
+        self._banked_progress[envs_idx] = 0.0
+        self._best_gap[envs_idx] = 0.0  # set from the real gap on the episode's first step
+        self._pulse_ee_z[envs_idx] = 0.0  # hand height at the last pulse; 0 until one fires
 
-    def _compute_smoothness_penalties(self) -> tuple[torch.Tensor, torch.Tensor]:
-        """Charge acceleration and discrete jerk; refund preparation only on a real trigger.
-
-        History holds actual charges, never refunds, in chronological order. A pulse
-        refunds the preceding six steps once, then exempts the trigger and next eight
-        steps. Refunds cancel undiscounted charges; PPO still discounts delayed rewards.
-        """
-        acc_excess = (self.target_z_acc.abs() - self.Z_ACC_PENALTY_THRESHOLD).clamp(min=0.0)
-        acc_cost = -self.Z_ACC_PENALTY_WEIGHT * (acc_excess / self.Z_ACC_MAX).square()
-        acc_change = (self.target_z_acc - self.prev_target_z_acc) / (2.0 * self.Z_ACC_MAX)
-        jerk_cost = -self.JERK_PENALTY_WEIGHT * acc_change.square()
-        costs = torch.stack((acc_cost, jerk_cost), dim=-1)
-
-        refund = torch.where(self._pulse_fired[:, None], -self._smoothness_history.sum(dim=1), 0.0)
-        self._smoothness_history[self._pulse_fired] = 0.0
-        self._smoothness_free_steps = torch.where(
-            self._pulse_fired,
-            self.SMOOTHNESS_FREE_STEPS_AFTER_PULSE + 1,
-            self._smoothness_free_steps,
-        )
-        costs = torch.where((self._smoothness_free_steps > 0)[:, None], 0.0, costs)
-        self._smoothness_free_steps = (self._smoothness_free_steps - 1).clamp(min=0)
-        self._smoothness_history = torch.roll(self._smoothness_history, shifts=-1, dims=1)
-        self._smoothness_history[:, -1] = costs
-        return (costs + refund).unbind(dim=-1)
+    def _regrasp_height_factor(self, pulse_ee_z: torch.Tensor) -> torch.Tensor:
+        """Regrasp bonus multiplier for the hand height at which the pulse fired."""
+        z_low, factor_low = self.REGRASP_BONUS_HEIGHT_LOW
+        z_high, factor_high = self.REGRASP_BONUS_HEIGHT_HIGH
+        frac = ((pulse_ee_z - z_low) / (z_high - z_low)).clamp(0.0, 1.0)
+        return factor_low + (factor_high - factor_low) * frac
 
     def _compute_done_and_reward(self) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """
-        Task rewards plus motion costs:
-          1. Terminal:       success +SUCCESS_REWARD (minus time penalty), timeout
-                             -TIMEOUT_PENALTY, fail -fail_penalty() (always worse than timeout)
-          2. Regrasp bonus:  capped positive improvement bonus; negative if error worsens
-          3. Smoothness:     acceleration and acceleration-change costs with pulse refunds
-          4. Proximity, speed, direction-change and blockade terms as weighted below
+        """Termination, then the reward described next to the reward constants.
 
-        The regrasp bonus requires completing release→regrasp with improved error.
-        A pulse trigger additionally refunds recent smoothness charges, once.
-        Recommended gamma: 0.99 (terminal signal meaningful up to ~200 steps out).
+        Task terms: progress_reward, regrasp_bonus, success_reward, fail_penalty, time_penalty,
+        wait_penalty.
+        Style terms (x STYLE_SCALE): acc_up_penalty, jerk_penalty, blocked_pulse_penalty.
         """
         cuboid_pos = self.cuboid.get_pos()  # (N, 3)
         ee_pos = self.ee_link.get_pos()  # (N, 3)
@@ -899,7 +929,7 @@ class FrankaEnvParallelTiltedNoForce:
 
         success_candidate = (
             (~timeout)
-            & ((cuboid_rel_z - self.desired_rel_z).abs() <= 0.005)
+            & ((cuboid_rel_z - self.desired_rel_z).abs() <= self.SUCCESS_GAP_TOLERANCE)
             & (ee_vel_z.abs() < self.SUCCESS_EE_VEL_MAX)
             & (self._firm_grasp_steps >= 3)
             & (ee_z >= self.SUCCESS_EE_Z_MIN)
@@ -927,6 +957,13 @@ class FrankaEnvParallelTiltedNoForce:
         regrasp_event = self._in_release & firm_grasp  # (N,)
         self._in_release = (self._in_release | fully_released) & (~regrasp_event)
 
+        # Grasp-axis error against the commanded offset, before the release that led to
+        # this regrasp and after it. Computed here rather than with the regrasp bonus
+        # below because the bad-regrasp termination needs it while fail is still open.
+        z_err_before = (self._release_cuboid_rel_z - self.desired_rel_z).abs()  # (N,)
+        z_err_after = (cuboid_rel_z - self.desired_rel_z).abs()  # (N,)
+        z_improvement = z_err_before - z_err_after  # (N,) positive = closer
+
         # Optional: terminate episode after too many regrasps
         # Always terminate as failure on the REGRASP_TERMINATION_COUNT-th regrasp
         limit_fail = regrasp_event & (self._regrasp_count + 1 >= self.REGRASP_TERMINATION_COUNT)
@@ -948,151 +985,95 @@ class FrankaEnvParallelTiltedNoForce:
             done = done | success
         self._regrasp_count += regrasp_event.long()
 
-        # ---- regrasp bonus: reward = 0 for opening alone; stronger penalty if z_error got worse ----
-        # Positive raw bonus capped at 10000; 0 mm improvement → 0; worse → negative x5.
-        # All distances are along the fixed grasp axis. Gravity in these coordinates
-        # is the projection of world gravity; no vertical free-fall estimate is used.
-        z_err_before = (self._release_cuboid_rel_z - self.desired_rel_z).abs()  # (N,)
-        z_err_after = (cuboid_rel_z - self.desired_rel_z).abs()  # (N,)
-        z_improvement = z_err_before - z_err_after  # (N,) positive = closer
-        raw_regrasp_bonus = (z_improvement.clamp(min=-0.05) * 7500.0) * ((z_improvement.abs() / 0.0075) ** 3)
-        raw_regrasp_bonus = raw_regrasp_bonus.clamp(max=self.REGRASP_BONUS_CAP)
-        raw_regrasp_bonus = torch.where(
-            raw_regrasp_bonus < 0.0,
-            raw_regrasp_bonus * 5.0,
-            raw_regrasp_bonus,
-        )
-        raw_regrasp_bonus = raw_regrasp_bonus.clamp(min=-3000.0)
-        # Bonus only for the first REGRASP_BONUS_MAX_COUNT regrasps. _regrasp_count was
-        # already incremented above, so the k-th regrasp event sees _regrasp_count == k.
-        bonus_eligible = regrasp_event & (self._regrasp_count <= self.REGRASP_BONUS_MAX_COUNT)
-        regrasp_bonus = raw_regrasp_bonus * bonus_eligible.float()  # (N,)
+        # ================================ reward ================================
+        # ---- task ----
+        # Progress is 0 where the object started and 1 on target. It is banked only while
+        # the fingers hold the object, so the swing of a free object mid-pulse is never
+        # paid; the regrasp pays the stroke's net result in one go.
+        gap = (cuboid_rel_z - self.desired_rel_z).abs()  # (N,) metres
+        start_gap = self.desired_rel_z.abs().clamp(min=1e-4)  # the object starts at rel_z = 0
+        progress = (1.0 - gap / start_gap).clamp(min=self.PROGRESS_MIN)  # (N,)
+        first_step = self.episode_length_buf == 1
+        self._banked_progress = torch.where(first_step, progress, self._banked_progress)
+        progress_reward = self.PROGRESS_REWARD * (progress - self._banked_progress) * firm_grasp_now.float()
+        self._banked_progress = torch.where(firm_grasp_now, progress, self._banked_progress)
 
-        # ---- proximity reward: dense, exponential, never negative ----
-        # Distance along the fixed grasp axis between where the cuboid sits in the
-        # fingers and where it was asked to sit. Paid every step, so it shapes the
-        # approach instead of only scoring the regrasp that caused it.
-        proximity_gap = (cuboid_rel_z - self.desired_rel_z).abs()  # (N,) metres
-        # The first reward step after a reset records the starting gap; the episode is
-        # scored against it, so every commanded offset runs from 0 at the start to MAX.
-        self._init_proximity_gap = torch.where(
-            self._init_proximity_gap < 0.0,
-            proximity_gap.clamp(min=self.PROXIMITY_INIT_GAP_MIN),
-            self._init_proximity_gap,
-        )
-        _k = self.PROXIMITY_REWARD_SHARPNESS
-        _floor = math.exp(-_k)
-        _decay = torch.exp(-_k * proximity_gap / self._init_proximity_gap)
-        proximity_reward = self.PROXIMITY_REWARD_MAX * (_decay - _floor) / (1.0 - _floor)
-        proximity_reward = proximity_reward.clamp(0.0, self.PROXIMITY_REWARD_MAX)  # (N,)
+        # Regrasp bonus: only for ground the object had not reached before in this episode,
+        # measured at the regrasp. Exponential in the gain from the small anchor point up,
+        # so a larger gain is worth disproportionately more.
+        self._best_gap = torch.where(first_step, gap, self._best_gap)
+        new_ground = (self._best_gap - gap).clamp(min=0.0) * regrasp_event.float()  # (N,) metres
+        gain_ref, bonus_ref = self.REGRASP_BONUS_SMALL
+        regrasp_bonus = torch.where(
+            new_ground >= gain_ref,
+            bonus_ref * torch.exp(self.REGRASP_BONUS_RATE * (new_ground - gain_ref)),
+            bonus_ref * new_ground / gain_ref,
+        ).clamp(max=self.REGRASP_BONUS_CAP)
+        # Remember the hand height on the step a pulse is accepted; the regrasp that follows
+        # is paid in proportion to it.
+        self._pulse_ee_z = torch.where(self._pulse_fired, ee_z, self._pulse_ee_z)
+        regrasp_bonus = regrasp_bonus * self._regrasp_height_factor(self._pulse_ee_z)
+        self._best_gap = torch.where(regrasp_event, torch.minimum(self._best_gap, gap), self._best_gap)
 
-        # These terms include positive refunds on accepted pulse triggers.
-        z_acc_penalty, jerk_penalty = self._compute_smoothness_penalties()
+        success_reward = self.SUCCESS_REWARD * success.float()
+        fail_penalty = -self.FAIL_PENALTY * fail.float()
+        time_penalty = torch.full_like(gap, -self.TIME_PENALTY)
 
-        # ---- commanded-velocity sign flips ----
-        # Charged at every step the commanded z velocity reverses, in proportion to how far
-        # apart the two samples are. torch.sign is 0 at exactly zero, so a product below zero
-        # means both samples are non-zero and point opposite ways.
-        _sign_flip = (torch.sign(self.prev_target_z_vel) * torch.sign(self.target_z_vel)) < 0
-        _flip_jump = (self.target_z_vel - self.prev_target_z_vel).abs()  # (N,) m/s
-        self.direction_change_count = self.direction_change_count + _sign_flip.long()
-        vel_sign_flip_penalty = -self.VEL_SIGN_FLIP_PENALTY_PER_MPS * _flip_jump * _sign_flip.float()  # (N,)
+        # ---- style ----
+        # Upward acceleration beyond the limit. Braking out of the descent is upward too,
+        # so the same limit keeps the stop gentle; the reversal is downward and is free.
+        acc = self.target_z_acc  # (N,) commanded, m/s^2
+        acc_up_excess = (acc - self.ACC_UP_LIMIT).clamp(min=0.0) / (self.Z_ACC_MAX - self.ACC_UP_LIMIT)
+        acc_up_penalty = -self.ACC_UP_PENALTY * acc_up_excess.square()
 
-        # ---- grasp-axis speed penalty ----
-        # Measured speed beyond the deadzone, charged at every step of every period. The
-        # blockade term below reuses the same excess and adds its own cost on top while
-        # opening is blocked, so motion is never free but is most expensive while waiting.
-        _vel_excess = (ee_vel_z.abs() - self.BLOCKADE_VEL_TOLERANCE).clamp(min=0.0)  # (N,)
-        speed_penalty = -self.SPEED_PENALTY_WEIGHT * (_vel_excess / self.Z_VEL_MAX).square()  # (N,)
+        # Change in commanded acceleration from one step to the next.
+        jerk = (acc - self.prev_target_z_acc) / self.Z_ACC_MAX
+        jerk_penalty = -self.JERK_PENALTY * jerk.square()
 
-        # ---- motion while opening is blocked ----
-        # Reward runs after episode_length_buf advances, but before the trigger clock
-        # advances. Recover the episode step used to gate the action just executed.
-        _remaining_steps = torch.maximum(
-            self._pulse_lockout_steps - self._steps_since_pulse,
-            self.PULSE_START_MIN_STEPS - (self.episode_length_buf - 1),
-        )
-        _prep_steps = max(0, int(round(self.BLOCKADE_PREP_DURATION / self.target_period)))
-        _settle_steps = max(0, int(round(self.BLOCKADE_SETTLE_DURATION / self.target_period)))
-        _idle_blockade = (
-            (_remaining_steps > _prep_steps)
-            & (self._steps_since_pulse > _settle_steps)
-            & (self._gripper_pulse_steps == 0)
-        )
-        blockade_motion_penalty = -_idle_blockade.float() * (
-            (_vel_excess / self.BLOCKADE_VEL_SCALE).square()
-            + self.BLOCKADE_COMMAND_WEIGHT * (self.target_z_vel / self.BLOCKADE_VEL_SCALE).square()
-        )
+        # Commanded motion inside the wait window. Reward runs after episode_length_buf
+        # advances and before the trigger clock does, so both are stepped back to the
+        # values that gated the action just executed.
+        settle_steps = int(round(self.STROKE_SETTLE_DURATION / self.target_period))
+        in_wait = (self.episode_length_buf - 1 < self.PULSE_START_MIN_STEPS) | (
+            (self._steps_since_pulse >= settle_steps) & (self._steps_since_pulse < self._pulse_lockout_steps)
+        )  # (N,)
+        wait_penalty = -self.WAIT_PENALTY * in_wait.float() * (self.target_z_vel / self.Z_VEL_MAX).square()
+
+        # A pulse requested while the env is refusing them; see the raw-edge detection in step().
+        blocked_pulse_penalty = -self.BLOCKED_PULSE_PENALTY * self._blocked_pulse_now.float()
 
         # Advance the trigger clock, capped one past the lockout so the counter cannot
         # grow without bound.
         self._steps_since_pulse = (self._steps_since_pulse + 1).clamp(max=self._pulse_lockout_steps + 1)
 
-        # ---- terminal reward (dominates with gamma=0.99) ----
-        ep = self.episode_length_buf.float()
-        base_reward = torch.where(
-            success,
-            self.SUCCESS_REWARD - ep * self.SUCCESS_TIME_PENALTY,
-            torch.where(
-                fail,  # checked before timeout: fail wins
-                torch.full_like(ee_z, -self.fail_penalty()),
-                torch.where(
-                    timeout,
-                    torch.full_like(ee_z, -self.TIMEOUT_PENALTY),
-                    torch.full_like(ee_z, -self.ALIVE_PENALTY),  # urgency to finish
-                ),
-            ),
-        )
+        # ---- diagnostics (not rewarded) ----
+        _sign_flip = (torch.sign(self.prev_target_z_vel) * torch.sign(self.target_z_vel)) < 0
+        self.direction_change_count = self.direction_change_count + _sign_flip.long()
+        _no_pulse = done & (self._pulse_count == 0)  # episode ended without ever firing a pulse
 
-        # ---- post-pulse hold penalty: penalise instability after regrasp ----
-        _in_delay_window = self._post_pulse_delay_countdown > 0
-        _in_hold_window = (~_in_delay_window) & (self._post_pulse_hold_countdown > 0)  # (N,)
-
-        # Penalize velocity if it exceeds the limit
-        vel_err = (ee_vel_z.abs() - self.POST_PULSE_HOLD_VEL_MAX).clamp(min=0.0)
-        # Penalize distance from target
-        z_err = (ee_z - self.POST_PULSE_HOLD_Z_TARGET).abs()
-
-        post_pulse_hold_penalty = torch.where(
-            _in_hold_window,
-            -(vel_err * self.POST_PULSE_HOLD_PENALTY_VEL) - (z_err * self.POST_PULSE_HOLD_PENALTY_Z),
-            torch.zeros_like(ee_z),
-        )  # (N,)
-
-        # Decrement the countdowns
-        self._post_pulse_hold_countdown = torch.where(
-            (~_in_delay_window) & (self._post_pulse_hold_countdown > 0),
-            self._post_pulse_hold_countdown - 1,
-            self._post_pulse_hold_countdown,
-        )
-        self._post_pulse_delay_countdown = (self._post_pulse_delay_countdown - 1).clamp(min=0)
-
-        _w = self.REWARD_TERM_WEIGHTS
-        reward = (
-            _w["base_reward"] * base_reward
-            + _w["proximity_reward"] * proximity_reward
-            + _w["regrasp_bonus"] * regrasp_bonus
-            + _w["z_acc_penalty"] * z_acc_penalty
-            + _w["jerk_penalty"] * jerk_penalty
-            + _w["vel_sign_flip_penalty"] * vel_sign_flip_penalty
-            + _w["blockade_motion_penalty"] * blockade_motion_penalty
-            + _w["speed_penalty"] * speed_penalty
-        )
+        terms = {
+            "progress_reward": progress_reward,
+            "regrasp_bonus": regrasp_bonus,
+            "success_reward": success_reward,
+            "fail_penalty": fail_penalty,
+            "time_penalty": time_penalty,
+            "acc_up_penalty": acc_up_penalty,
+            "jerk_penalty": jerk_penalty,
+            "wait_penalty": wait_penalty,
+            "blocked_pulse_penalty": blocked_pulse_penalty,
+        }
+        reward = sum(self.REWARD_TERM_WEIGHTS[name] * value for name, value in terms.items())
 
         self.last_reward_terms = {
-            "base_reward": base_reward.detach().clone(),
-            "proximity_reward": proximity_reward.detach().clone(),
-            "regrasp_bonus": regrasp_bonus.detach().clone(),
-            "z_acc_penalty": z_acc_penalty.detach().clone(),
-            "jerk_penalty": jerk_penalty.detach().clone(),
-            "vel_sign_flip_penalty": vel_sign_flip_penalty.detach().clone(),
-            "blockade_motion_penalty": blockade_motion_penalty.detach().clone(),
-            "speed_penalty": speed_penalty.detach().clone(),
-            "proximity_gap": proximity_gap.detach().clone(),
+            **{name: value.detach().clone() for name, value in terms.items()},
+            "proximity_gap": gap.detach().clone(),
+            "progress": progress.detach().clone(),
+            "in_wait": in_wait.float(),
             "direction_change_count": self.direction_change_count.float().detach().clone(),
             "z_improvement": z_improvement.detach().clone(),
             "avg_force": avg_force.detach().clone(),
             "regrasp_event": regrasp_event.float().detach().clone(),
+            "pulse_ee_z": self._pulse_ee_z.detach().clone(),
             "success_candidate": success_candidate.float().detach().clone(),
             "success_steps": self._success_steps.float().detach().clone(),
             # ep_* keys describe how an episode ended. They are read by the training
@@ -1109,6 +1090,8 @@ class FrankaEnvParallelTiltedNoForce:
             "ep_fail_ee_low": fail_ee_low.float(),
             "ep_fail_ee_high": fail_ee_high.float(),
             "ep_fail_regrasp_limit": limit_fail.float(),
+            "ep_no_pulse": _no_pulse.float(),
+            "ep_pulse_count": self._pulse_count.float(),
         }
 
         return done, reward, timeout
@@ -1127,10 +1110,11 @@ class FrankaEnvParallelTiltedNoForce:
         self.target_z_vel[envs_idx] = 0.0
         self.target_z_acc[envs_idx] = 0.0
         self.prev_target_z_vel[envs_idx] = 0.0
-        self._reset_smoothness_state(envs_idx)
+        self._reset_reward_state(envs_idx)
         self.direction_change_count[envs_idx] = 0
         _n = len(envs_idx)
-        _mag = 0.0125 + torch.rand(_n, device=self.device) * 0.01  # uniform in [0.015, 0.035]
+        _mag = 0.01 + torch.rand(_n, device=self.device) * 0.025  # uniform in [0.01, 0.02]
+        # _mag = 0.04
         if self.mix:
             _sign = torch.where(
                 torch.rand(_n, device=self.device) < 0.5,
@@ -1151,7 +1135,6 @@ class FrankaEnvParallelTiltedNoForce:
         self._regrasp_duration_steps[envs_idx] = 0
         self._prev_cuboid_rel_z[envs_idx] = 0.0
         self._release_cuboid_rel_z[envs_idx] = 0.0
-        self._init_proximity_gap[envs_idx] = -1.0
         self._firm_grasp_steps[envs_idx] = 0
         self._success_steps[envs_idx] = 0
         self._filt_u1[envs_idx] = 0.0
@@ -1159,12 +1142,13 @@ class FrankaEnvParallelTiltedNoForce:
         self._filt_y1[envs_idx] = 0.0
         self._filt_y2[envs_idx] = 0.0
         self._gripper_pulse_steps[envs_idx] = 0
+        self._pulse_count[envs_idx] = 0
+        self._prev_gripper_req[envs_idx] = self.gripper_pos_min.mean()
+        self._blocked_pulse_now[envs_idx] = False
         self._sample_gripper_pulse_delays(envs_idx)
         self._sample_gripper_pulse_lengths(envs_idx)
         self._randomize_finger_gains(envs_idx)
         self._prev_gripper_avg[envs_idx] = self.gripper_pos_min.mean()
-        self._post_pulse_delay_countdown[envs_idx] = 0
-        self._post_pulse_hold_countdown[envs_idx] = 0
         self._steps_since_pulse[envs_idx] = self._pulse_lockout_steps + 1
         self._randomize_friction(envs_idx)
 
@@ -1197,8 +1181,8 @@ class FrankaEnvParallelTiltedNoForce:
         """
         n = len(envs_idx)
         friction_min = self.FRICTION_RANDOM_MIN if self.randomize else self.FRICTION_MIN
-        ratio_min = friction_min / self.FRICTION_BASE  # 0.15 / 0.75 = 0.2, or 0.6 / 0.75 = 0.8
-        ratio_max = self.FRICTION_MAX / self.FRICTION_BASE  # 0.90 / 0.75 = 1.2
+        ratio_min = friction_min / self.FRICTION_BASE  # 0.2 / 0.75 = 0.267, randomize or not
+        ratio_max = self.FRICTION_MAX / self.FRICTION_BASE  # 0.5 / 0.75 = 0.667
         # Per-env ratio: (n,)
         ratio = ratio_min + torch.rand(n, device=self.device) * (ratio_max - ratio_min)
         # set_geoms_friction_ratio expects shape (n_envs, n_geoms)
