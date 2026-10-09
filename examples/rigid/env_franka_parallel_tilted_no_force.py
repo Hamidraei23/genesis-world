@@ -155,17 +155,17 @@ class FrankaEnvParallelTiltedNoForce:
     # open fingers, keep descending until they have closed again, brake gently to rest.
     #
     # Task terms pay for the outcome:
-    #   progress_reward  PROGRESS_REWARD x the fraction of the starting gap closed. Banked
-    #                    whenever the fingers hold the object, so a stroke is paid on the
-    #                    regrasp; moving away is charged at the same rate. Closing the
-    #                    whole gap is worth PROGRESS_REWARD however far the target is.
+    #   progress_reward  PROGRESS_REWARD x the change in the fraction of the starting gap
+    #                    closed, paid every step whether the object is held or free;
+    #                    moving away is charged at the same rate. Closing the whole gap
+    #                    is worth PROGRESS_REWARD however far the target is.
     #   regrasp_bonus    A learning aid on top of progress, meant to be switched off (weight
     #                    0) once the stroke is learned. Paid on a regrasp that leaves the
     #                    object closer to the target than at any earlier point of the
-    #                    episode, and exponentially more for a bigger gain: 100 for 1 mm
-    #                    of new ground, 1000 for 5 mm, at most REGRASP_BONUS_CAP. Only new
-    #                    ground counts, so sliding the object away and back earns nothing
-    #                    a second time.
+    #                    episode by at least 1 mm, and exponentially more for a bigger
+    #                    gain: 100 for 1 mm of new ground, 1000 for 5 mm, at most
+    #                    REGRASP_BONUS_CAP; below 1 mm nothing. Only new ground counts, so
+    #                    sliding the object away and back earns nothing a second time.
     #                    The bonus is then multiplied by a factor set by the hand height
     #                    (ee_z) at which the pulse behind that regrasp fired: 0.5 at
     #                    0.65 m, rising in a straight line to 1.0 at 0.85 m, and flat
@@ -199,7 +199,8 @@ class FrankaEnvParallelTiltedNoForce:
     PROGRESS_MIN = -0.5  # progress is clipped here, so one bad release costs at most half
     # Two (gain in metres, bonus) points the regrasp bonus passes through. From the small
     # point upwards it is the exponential through both (x10 every 4 mm with these values),
-    # capped at the top; below the small point it falls in a straight line to zero.
+    # capped at the top; below the small point nothing is paid (2026-10-08: was a straight
+    # line to zero, which paid sub-millimetre jitter collected by a one-step open-close).
     REGRASP_BONUS_SMALL = (0.001, 100.0)
     REGRASP_BONUS_LARGE = (0.005, 1000.0)
     REGRASP_BONUS_RATE = math.log(REGRASP_BONUS_LARGE[1] / REGRASP_BONUS_SMALL[1]) / (
@@ -250,14 +251,18 @@ class FrankaEnvParallelTiltedNoForce:
     SUCCESS_EE_Z_MAX = 0.86
     SUCCESS_EE_VEL_MAX = 0.05  # m/s: |ee_vel_z| must be below this to count as settled
     SUCCESS_REQUIRED_STEPS = 2
-    # Fixed at 2 steps = 40 ms, with or without --randomize: the delay is not a
-    # domain-randomised quantity, so every episode sees the same command-to-open lag.
-    PULSE_DELAY_STEPS = 2  # target-period steps to wait before the open window begins
-    # Read by the pulse sweep tooling (eval_test_franka_delays, test_gripper_pulse_plot),
-    # which captures and pins these. They do not drive _sample_gripper_pulse_delays;
-    # they are held at PULSE_DELAY_STEPS so a captured "native range" is the truth.
-    PULSE_DELAY_RANDOM_MIN = 2  # 40 ms
-    PULSE_DELAY_RANDOM_MAX = 2  # 40 ms
+    # Command-to-open lag of the hand, in target-period steps. Without --randomize every
+    # episode uses PULSE_DELAY_STEPS; with --randomize each episode draws an integer from
+    # [PULSE_DELAY_RANDOM_MIN, PULSE_DELAY_RANDOM_MAX] (2026-10-08; before, the delay was
+    # fixed either way). 0 forces the fingers open on the trigger step itself; a delay of
+    # d >= 2 leaves d - 1 passthrough steps after the trigger where the policy still
+    # commands the fingers. The whole pulse (delay + 6 open + 1 close) must fit inside
+    # STROKE_SETTLE_DURATION: 3 + 7 = 10 steps against 15.
+    # The robot does not replay this delay: the real hand produces it, so the range here
+    # should bracket the measured latency.
+    PULSE_DELAY_STEPS = 2  # 20 ms, used when not randomizing
+    PULSE_DELAY_RANDOM_MIN = 0  # 0 ms
+    PULSE_DELAY_RANDOM_MAX = 3  # 60 ms
     # steps: PULSE_LENGTH - 1 forced-open steps, then 1 forced-close step, then back to
     # policy control. 7 puts the forced-open window at 6 steps = 120 ms.
     PULSE_LENGTH = 7
@@ -987,16 +992,20 @@ class FrankaEnvParallelTiltedNoForce:
 
         # ================================ reward ================================
         # ---- task ----
-        # Progress is 0 where the object started and 1 on target. It is banked only while
-        # the fingers hold the object, so the swing of a free object mid-pulse is never
-        # paid; the regrasp pays the stroke's net result in one go.
+        # Progress is 0 where the object started and 1 on target. Its change is paid on
+        # EVERY step, held or free (2026-10-08; before, only while the fingers held the
+        # object). It is a potential difference, so an episode's total is the same as
+        # paying the net result at the regrasp -- a swing up that falls back pays and
+        # then charges the same amount -- but the credit now lands on the step where the
+        # hand's motion actually moved the object, which is what a policy learning the
+        # stroke from scratch needs to see.
         gap = (cuboid_rel_z - self.desired_rel_z).abs()  # (N,) metres
         start_gap = self.desired_rel_z.abs().clamp(min=1e-4)  # the object starts at rel_z = 0
         progress = (1.0 - gap / start_gap).clamp(min=self.PROGRESS_MIN)  # (N,)
         first_step = self.episode_length_buf == 1
         self._banked_progress = torch.where(first_step, progress, self._banked_progress)
-        progress_reward = self.PROGRESS_REWARD * (progress - self._banked_progress) * firm_grasp_now.float()
-        self._banked_progress = torch.where(firm_grasp_now, progress, self._banked_progress)
+        progress_reward = self.PROGRESS_REWARD * (progress - self._banked_progress)
+        self._banked_progress = progress
 
         # Regrasp bonus: only for ground the object had not reached before in this episode,
         # measured at the regrasp. Exponential in the gain from the small anchor point up,
@@ -1004,10 +1013,12 @@ class FrankaEnvParallelTiltedNoForce:
         self._best_gap = torch.where(first_step, gap, self._best_gap)
         new_ground = (self._best_gap - gap).clamp(min=0.0) * regrasp_event.float()  # (N,) metres
         gain_ref, bonus_ref = self.REGRASP_BONUS_SMALL
+        # Nothing below the anchor: sub-millimetre "new ground" is object settling and
+        # observation jitter, and a one-step open-close used to collect it.
         regrasp_bonus = torch.where(
             new_ground >= gain_ref,
             bonus_ref * torch.exp(self.REGRASP_BONUS_RATE * (new_ground - gain_ref)),
-            bonus_ref * new_ground / gain_ref,
+            torch.zeros_like(new_ground),
         ).clamp(max=self.REGRASP_BONUS_CAP)
         # Remember the hand height on the step a pulse is accepted; the regrasp that follows
         # is paid in proportion to it.
@@ -1195,8 +1206,17 @@ class FrankaEnvParallelTiltedNoForce:
         )
 
     def _sample_gripper_pulse_delays(self, envs_idx: torch.Tensor):
-        """Set per-env pulse delays. Fixed at PULSE_DELAY_STEPS, randomize or not."""
-        self._gripper_pulse_delays[envs_idx] = self.PULSE_DELAY_STEPS
+        """Set per-env pulse delays: PULSE_DELAY_STEPS, or a per-episode draw with randomize."""
+        if self.randomize:
+            self._gripper_pulse_delays[envs_idx] = torch.randint(
+                self.PULSE_DELAY_RANDOM_MIN,
+                self.PULSE_DELAY_RANDOM_MAX + 1,
+                (len(envs_idx),),
+                dtype=torch.long,
+                device=self.device,
+            )
+        else:
+            self._gripper_pulse_delays[envs_idx] = self.PULSE_DELAY_STEPS
 
     def _sample_gripper_pulse_lengths(self, envs_idx: torch.Tensor):
         """Set per-env pulse lengths, optionally randomized per episode."""
